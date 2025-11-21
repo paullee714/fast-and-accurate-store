@@ -25,27 +25,26 @@ go run cmd/fas/main.go
 ```
 
 ### Usage (Client)
-A dedicated CLI is under development. Currently, you can use `nc` to communicate with the server.
+You can use the dedicated CLI tool `fs` to communicate with the server.
 
 **1. Data Operations**
 ```bash
 # Set data (SET key value)
-echo "SET mykey hello_world" | nc localhost 6379
+go run cmd/fs/main.go SET mykey hello_world
 
 # Get data (GET key)
-echo "GET mykey" | nc localhost 6379
+go run cmd/fs/main.go GET mykey
 ```
 
 **2. Pub/Sub (Messaging)**
 *Terminal 1 (Subscriber)*
 ```bash
-nc localhost 6379
-SUBSCRIBE news
+go run cmd/fs/main.go SUBSCRIBE news
 ```
 
 *Terminal 2 (Publisher)*
 ```bash
-echo "PUBLISH news breaking_news!" | nc localhost 6379
+go run cmd/fs/main.go PUBLISH news breaking_news!
 ```
 
 ## 📚 Documentation

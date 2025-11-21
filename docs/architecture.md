@@ -6,7 +6,7 @@ System architecture documentation for FAS (Fast and Accurate System).
 
 ```mermaid
 graph TD
-    Client[Client (nc / CLI)] -->|TCP Connection| Server[TCP Server]
+    Client[Client (fs CLI)] -->|TCP Connection| Server[TCP Server]
     Server -->|Stream| Parser[Protocol Parser]
     Parser -->|Command Object| Executor[Command Executor]
     Executor -->|Read/Write| Store[In-Memory Store]
