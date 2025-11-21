@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 
+	"fas/pkg/persistence"
 	"fas/pkg/protocol"
 	"fas/pkg/pubsub"
 	"fas/pkg/store"
@@ -15,8 +16,9 @@ import (
 
 // Config holds the configuration for the server.
 type Config struct {
-	Host string
-	Port int
+	Host    string
+	Port    int
+	AOFPath string // Path to the AOF file
 }
 
 // Server represents the TCP server instance.
@@ -25,6 +27,7 @@ type Server struct {
 	ln     net.Listener
 	store  *store.Store
 	pubsub *pubsub.PubSub
+	aof    *persistence.AOF
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -39,6 +42,26 @@ func NewServer(config Config) *Server {
 // Start initializes the TCP listener and starts accepting connections.
 // It blocks until the server stops or an error occurs.
 func (s *Server) Start() error {
+	// Initialize AOF
+	if s.config.AOFPath != "" {
+		aof, err := persistence.NewAOF(s.config.AOFPath)
+		if err != nil {
+			return fmt.Errorf("failed to open AOF file: %v", err)
+		}
+		s.aof = aof
+		defer s.aof.Close()
+
+		// Restore state from AOF
+		log.Println("Restoring state from AOF...")
+		err = s.aof.ReadCommands(func(cmd *protocol.Command) {
+			s.executeCommand(cmd, true) // true = replay mode (don't write to AOF again)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to restore from AOF: %v", err)
+		}
+		log.Println("State restored.")
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -82,7 +105,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return // Connection is now dedicated to subscription or closed
 		}
 
-		response := s.executeCommand(cmd)
+		response := s.executeCommand(cmd, false)
 		conn.Write([]byte(response + "\n"))
 	}
 }
@@ -109,13 +132,20 @@ func (s *Server) handleSubscribe(conn net.Conn, cmd *protocol.Command) {
 }
 
 // executeCommand executes a single command and returns the response string.
-func (s *Server) executeCommand(cmd *protocol.Command) string {
+// replay: if true, indicates we are replaying from AOF (so don't write to AOF again)
+func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) < 2 {
 			return "ERR wrong number of arguments for 'set' command"
 		}
 		s.store.Set(cmd.Args[0], strings.Join(cmd.Args[1:], " "), 0)
+
+		// Persist to AOF if not replaying
+		if !replay && s.aof != nil {
+			s.aof.Write(cmd)
+		}
+
 		return "OK"
 	case "GET":
 		if len(cmd.Args) < 1 {

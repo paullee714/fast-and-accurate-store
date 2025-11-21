@@ -12,8 +12,9 @@ func main() {
 
 	// Configure the server
 	cfg := server.Config{
-		Host: "0.0.0.0",
-		Port: 6379, // Default Redis port for familiarity
+		Host:    "0.0.0.0",
+		Port:    6379,
+		AOFPath: "fas.aof", // Enable persistence
 	}
 
 	// Initialize and start the server
