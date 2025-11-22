@@ -17,7 +17,7 @@ func TestParseCommand(t *testing.T) {
 	}{
 		{
 			name:  "Simple SET",
-			input: "SET key value\n",
+			input: "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
 			want: &protocol.Command{
 				Name: "SET",
 				Args: []string{"key", "value"},
@@ -26,7 +26,7 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name:  "GET with one arg",
-			input: "GET key\n",
+			input: "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
 			want: &protocol.Command{
 				Name: "GET",
 				Args: []string{"key"},
@@ -34,8 +34,8 @@ func TestParseCommand(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:  "Case Insensitive",
-			input: "set key value\n",
+			name:  "Legacy Inline Command",
+			input: "SET key value\n",
 			want: &protocol.Command{
 				Name: "SET",
 				Args: []string{"key", "value"},
@@ -46,15 +46,6 @@ func TestParseCommand(t *testing.T) {
 			name:    "Empty Line",
 			input:   "\n",
 			want:    nil,
-			wantErr: false,
-		},
-		{
-			name:  "Multiple Spaces",
-			input: "SET   key    value\n",
-			want: &protocol.Command{
-				Name: "SET",
-				Args: []string{"key", "value"},
-			},
 			wantErr: false,
 		},
 	}

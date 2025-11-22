@@ -47,6 +47,21 @@ go run cmd/fs/main.go SUBSCRIBE news
 go run cmd/fs/main.go PUBLISH news breaking_news!
 ```
 
+## 🧪 Testing
+We use Go's built-in testing framework.
+
+### Running Tests
+To run all tests:
+```bash
+go test ./test/...
+```
+
+### Verbose Output
+To see detailed step-by-step logs of what each test is doing:
+```bash
+go test -v ./test/...
+```
+
 ## 📚 Documentation
 - [Architecture Guide](docs/architecture.md)
 - [Command Reference](docs/commands.md)

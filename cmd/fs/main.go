@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"fas/pkg/protocol"
 )
 
 const (
@@ -24,8 +26,7 @@ func main() {
 
 	// If arguments are provided, execute single command
 	if len(os.Args) > 1 {
-		cmd := strings.Join(os.Args[1:], " ")
-		sendCommand(conn, cmd)
+		sendCommand(conn, os.Args[1:])
 		return
 	}
 
@@ -37,30 +38,62 @@ func main() {
 		if !scanner.Scan() {
 			break
 		}
-		cmd := strings.TrimSpace(scanner.Text())
-		if cmd == "" {
+		cmdLine := strings.TrimSpace(scanner.Text())
+		if cmdLine == "" {
 			continue
 		}
-		if cmd == "exit" || cmd == "quit" {
+		if cmdLine == "exit" || cmdLine == "quit" {
 			break
 		}
-		sendCommand(conn, cmd)
+		args := strings.Fields(cmdLine)
+		sendCommand(conn, args)
 	}
 }
 
-func sendCommand(conn net.Conn, cmd string) {
-	_, err := fmt.Fprintf(conn, "%s\n", cmd)
+func sendCommand(conn net.Conn, args []string) {
+	writer := protocol.NewWriter(conn)
+	err := writer.WriteCommand(args)
 	if err != nil {
 		fmt.Printf("Error sending command: %v\n", err)
 		return
 	}
 
-	// Read response
 	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
+
+	// If command is SUBSCRIBE, enter continuous loop
+	if len(args) > 0 && strings.ToUpper(args[0]) == "SUBSCRIBE" {
+		fmt.Println("Reading messages... (Press Ctrl+C to quit)")
+		for {
+			readAndPrintResponse(reader)
+		}
+	} else {
+		// Single response for other commands
+		readAndPrintResponse(reader)
+	}
+}
+
+func readAndPrintResponse(reader *bufio.Reader) {
+	text, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Printf("Error reading response: %v\n", err)
-		return
+		os.Exit(1) // Exit on connection error
 	}
-	fmt.Print(response)
+	fmt.Print(text)
+
+	// If it's a bulk string ($...), read the data line too
+	if strings.HasPrefix(text, "$") {
+		var length int
+		if _, err := fmt.Sscanf(text, "$%d", &length); err != nil {
+			fmt.Printf("Error parsing bulk string length: %v\n", err)
+			os.Exit(1)
+		}
+		if length != -1 {
+			data, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading bulk data: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Print(data)
+		}
+	}
 }

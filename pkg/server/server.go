@@ -16,9 +16,11 @@ import (
 
 // Config holds the configuration for the server.
 type Config struct {
-	Host    string
-	Port    int
-	AOFPath string // Path to the AOF file
+	Host        string
+	Port        int
+	AOFPath     string // Path to the AOF file
+	FsyncPolicy persistence.FsyncPolicy
+	MaxMemory   int64 // Max memory in bytes
 }
 
 // Server represents the TCP server instance.
@@ -32,9 +34,14 @@ type Server struct {
 
 // NewServer creates a new Server instance with the given configuration.
 func NewServer(config Config) *Server {
+	// Default to 1GB if not set
+	if config.MaxMemory == 0 {
+		config.MaxMemory = 1024 * 1024 * 1024
+	}
+
 	return &Server{
 		config: config,
-		store:  store.New(),
+		store:  store.New(config.MaxMemory, store.EvictionAllKeysRandom),
 		pubsub: pubsub.New(),
 	}
 }
@@ -42,9 +49,12 @@ func NewServer(config Config) *Server {
 // Start initializes the TCP listener and starts accepting connections.
 // It blocks until the server stops or an error occurs.
 func (s *Server) Start() error {
+	// Start active expiration for store (only in multi-threaded mode)
+	s.store.StartActiveExpiration()
+
 	// Initialize AOF
 	if s.config.AOFPath != "" {
-		aof, err := persistence.NewAOF(s.config.AOFPath)
+		aof, err := persistence.NewAOF(s.config.AOFPath, s.config.FsyncPolicy)
 		if err != nil {
 			return fmt.Errorf("failed to open AOF file: %v", err)
 		}
@@ -86,12 +96,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	log.Printf("New connection from %s", conn.RemoteAddr())
 
 	reader := bufio.NewReader(conn)
+	writer := protocol.NewWriter(conn)
 
 	for {
 		cmd, err := protocol.ParseCommand(reader)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Read error: %v", err)
+				log.Printf("Error parsing command: %v", err)
+				writer.WriteError(err)
 			}
 			return
 		}
@@ -99,32 +111,71 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Handle SUBSCRIBE specially as it changes connection state
-		if cmd.Name == "SUBSCRIBE" {
-			s.handleSubscribe(conn, cmd)
+		// Handle SUBSCRIBE command specially as it changes connection state
+		if strings.ToUpper(cmd.Name) == "SUBSCRIBE" {
+			if len(cmd.Args) < 1 {
+				writer.WriteError(fmt.Errorf("wrong number of arguments for 'subscribe' command"))
+				continue
+			}
+			s.handleSubscribe(conn, writer, cmd.Args)
 			return // Connection is now dedicated to subscription or closed
 		}
 
 		response := s.executeCommand(cmd, false)
-		conn.Write([]byte(response + "\n"))
+
+		// Determine response type based on content
+		if strings.HasPrefix(response, "ERR ") {
+			writer.WriteError(fmt.Errorf(strings.TrimPrefix(response, "ERR ")))
+		} else if strings.HasPrefix(response, "(integer) ") {
+			var n int
+			fmt.Sscanf(response, "(integer) %d", &n)
+			writer.WriteInteger(n)
+		} else {
+			// Default to simple string for OK, or bulk string for values?
+			// For now, let's stick to simple string for status, and bulk for data.
+			// But executeCommand returns a string. We need to refine this.
+			// To keep it simple for this refactor, let's treat "OK" as simple string, others as bulk.
+			if response == "OK" {
+				writer.WriteString(response)
+			} else {
+				writer.WriteBulkString(response)
+			}
+		}
 	}
 }
 
 // handleSubscribe handles the subscription loop for a client.
 // It blocks until the client disconnects.
-func (s *Server) handleSubscribe(conn net.Conn, cmd *protocol.Command) {
-	if len(cmd.Args) < 1 {
-		conn.Write([]byte("ERR wrong number of arguments for 'subscribe' command\n"))
+func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channels []string) {
+	// We only support single channel subscription for now based on previous implementation
+	// But args can be multiple. Let's just take the first one for now or loop.
+	// The previous implementation took one channel.
+
+	if len(channels) == 0 {
+		writer.WriteError(fmt.Errorf("wrong number of arguments for 'subscribe' command"))
 		return
 	}
 
-	channelName := cmd.Args[0]
+	channelName := channels[0]
 	ch := s.pubsub.Subscribe(channelName)
-	conn.Write([]byte(fmt.Sprintf("Subscribed to %s\n", channelName)))
+	defer s.pubsub.Unsubscribe(channelName, ch)
+
+	// Send subscription confirmation
+	// Redis sends: *3\r\n$9\r\nsubscribe\r\n$len\r\nchannel\r\n:1\r\n
+	// But we are using a simplified protocol for now as per "RESP-like".
+	// Let's send a simple string or bulk string for confirmation?
+	// The previous implementation sent "Subscribed to %s\n".
+	// Let's send a bulk string "Subscribed to <channel>"
+	writer.WriteBulkString(fmt.Sprintf("Subscribed to %s", channelName))
 
 	// Block and forward messages
 	for msg := range ch {
-		_, err := conn.Write([]byte(msg + "\n"))
+		// Send message as bulk string
+		// Redis sends: *3\r\n$7\r\nmessage\r\n$len\r\nchannel\r\n$len\r\nmsg\r\n
+		// We will just send the message content as bulk string for simplicity,
+		// or maybe we should stick to the simple format for messages?
+		// If we use bulk string, the client (fs) will print it.
+		err := writer.WriteBulkString(msg)
 		if err != nil {
 			return // Client disconnected
 		}
@@ -136,10 +187,10 @@ func (s *Server) handleSubscribe(conn net.Conn, cmd *protocol.Command) {
 func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	switch cmd.Name {
 	case "SET":
-		if len(cmd.Args) < 2 {
+		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'set' command"
 		}
-		s.store.Set(cmd.Args[0], strings.Join(cmd.Args[1:], " "), 0)
+		s.store.Set(cmd.Args[0], cmd.Args[1], 0)
 
 		// Persist to AOF if not replaying
 		if !replay && s.aof != nil {
@@ -148,7 +199,7 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 
 		return "OK"
 	case "GET":
-		if len(cmd.Args) < 1 {
+		if len(cmd.Args) != 1 {
 			return "ERR wrong number of arguments for 'get' command"
 		}
 		val, err := s.store.Get(cmd.Args[0])
@@ -160,10 +211,10 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 		return val
 	case "PUBLISH":
-		if len(cmd.Args) < 2 {
+		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'publish' command"
 		}
-		count := s.pubsub.Publish(cmd.Args[0], strings.Join(cmd.Args[1:], " "))
+		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
