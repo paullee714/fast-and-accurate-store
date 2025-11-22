@@ -96,3 +96,56 @@ func TestPubSub_NoSubscribers(t *testing.T) {
 	}
 	t.Log("TestPubSub_NoSubscribers Passed")
 }
+
+func TestPubSub_Unsubscribe(t *testing.T) {
+	t.Log("Starting TestPubSub_Unsubscribe")
+	ps := pubsub.New()
+	channel := "unsub_channel"
+
+	t.Log("Step 1: Subscribing")
+	ch := ps.Subscribe(channel)
+
+	t.Log("Step 2: Unsubscribing")
+	ps.Unsubscribe(channel, ch)
+
+	t.Log("Step 3: Verifying channel closed")
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Error("Channel should be closed")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Timeout waiting for channel close")
+	}
+
+	t.Log("Step 4: Verifying publish count is 0")
+	count := ps.Publish(channel, "msg")
+	if count != 0 {
+		t.Errorf("Publish() count = %d, want 0", count)
+	}
+	t.Log("TestPubSub_Unsubscribe Passed")
+}
+
+func TestPubSub_SlowSubscriber(t *testing.T) {
+	t.Log("Starting TestPubSub_SlowSubscriber")
+	ps := pubsub.New()
+	channel := "slow_channel"
+
+	t.Log("Step 1: Subscribing")
+	_ = ps.Subscribe(channel)
+
+	// Fill buffer (buffer size is 100)
+	t.Log("Step 2: Filling buffer")
+	for i := 0; i < 100; i++ {
+		ps.Publish(channel, "msg")
+	}
+
+	// Publish one more, should be dropped
+	t.Log("Step 3: Publishing one more message (should be dropped)")
+	count := ps.Publish(channel, "dropped_msg")
+	if count != 0 {
+		t.Errorf("Publish() count = %d, want 0 (dropped)", count)
+	}
+
+	t.Log("TestPubSub_SlowSubscriber Passed")
+}
