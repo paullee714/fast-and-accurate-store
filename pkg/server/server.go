@@ -184,10 +184,10 @@ func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channel
 func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	switch cmd.Name {
 	case "SET":
-		if len(cmd.Args) < 2 {
+		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'set' command"
 		}
-		s.store.Set(cmd.Args[0], strings.Join(cmd.Args[1:], " "), 0)
+		s.store.Set(cmd.Args[0], cmd.Args[1], 0)
 
 		// Persist to AOF if not replaying
 		if !replay && s.aof != nil {
@@ -196,7 +196,7 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 
 		return "OK"
 	case "GET":
-		if len(cmd.Args) < 1 {
+		if len(cmd.Args) != 1 {
 			return "ERR wrong number of arguments for 'get' command"
 		}
 		val, err := s.store.Get(cmd.Args[0])
@@ -208,10 +208,10 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 		return val
 	case "PUBLISH":
-		if len(cmd.Args) < 2 {
+		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'publish' command"
 		}
-		count := s.pubsub.Publish(cmd.Args[0], strings.Join(cmd.Args[1:], " "))
+		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
