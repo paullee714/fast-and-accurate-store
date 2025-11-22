@@ -88,12 +88,12 @@ func readAndPrintResponse(reader *bufio.Reader) {
 			os.Exit(1)
 		}
 		if length != -1 {
-			data, err := reader.ReadString('\n')
-			if err != nil {
+			data := make([]byte, length+2)
+			if _, err := reader.Read(data); err != nil {
 				fmt.Printf("Error reading bulk data: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Print(data)
+			fmt.Print(string(data))
 		}
 	}
 }

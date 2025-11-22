@@ -21,12 +21,27 @@ type EventLoop struct {
 
 // ClientState holds the state for a connected client.
 type ClientState struct {
-	fd     int
-	buffer bytes.Buffer
+	fd           int
+	buffer       bytes.Buffer
+	writeBuffer  bytes.Buffer
+	writeEnabled bool
 }
 
 // StartEventLoop starts the kqueue-based event loop.
 func (s *Server) StartEventLoop() error {
+	// Parity with goroutine-per-connection path: start active expiration.
+	s.store.StartActiveExpiration()
+
+	// Initialize AOF and restore state if configured.
+	if s.config.AOFPath != "" {
+		aof, err := s.initAOF()
+		if err != nil {
+			return err
+		}
+		s.aof = aof
+		defer s.aof.Close()
+	}
+
 	// Create kqueue
 	kq, err := syscall.Kqueue()
 	if err != nil {
@@ -105,6 +120,8 @@ func (s *Server) StartEventLoop() error {
 					el.close(ident)
 				} else if event.Filter == syscall.EVFILT_READ {
 					el.read(ident)
+				} else if event.Filter == syscall.EVFILT_WRITE {
+					el.write(ident)
 				}
 			}
 		}
@@ -192,12 +209,7 @@ func (el *EventLoop) read(fd int) {
 		// Advance buffer
 		client.buffer.Next(consumed)
 
-		// Execute command
-		// We need a way to write back response.
-		// For now, synchronous write to non-blocking socket (might block/fail).
-		// Ideally we should buffer response and handle EAGAIN.
-		// MVP: Just write and hope it fits in kernel buffer.
-
+		// Execute command and buffer response for async write.
 		response := el.server.executeCommand(cmd, false)
 
 		// Format response (simplified)
@@ -208,18 +220,15 @@ func (el *EventLoop) read(fd int) {
 			var n int
 			fmt.Sscanf(response, "(integer) %d", &n)
 			respData = fmt.Sprintf(":%d\r\n", n)
+		} else if response == "(nil)" {
+			respData = "$-1\r\n"
 		} else if response == "OK" {
 			respData = "+OK\r\n"
 		} else {
 			respData = fmt.Sprintf("$%d\r\n%s\r\n", len(response), response)
 		}
 
-		_, err = syscall.Write(fd, []byte(respData))
-		if err != nil {
-			log.Printf("Write error: %v", err)
-			el.close(fd)
-			return
-		}
+		el.queueWrite(client, []byte(respData))
 	}
 }
 
@@ -227,4 +236,82 @@ func (el *EventLoop) close(fd int) {
 	syscall.Close(fd)
 	delete(el.connections, fd)
 	log.Printf("Connection closed (fd: %d)", fd)
+}
+
+// queueWrite appends data to the client's write buffer and enables EVFILT_WRITE.
+func (el *EventLoop) queueWrite(client *ClientState, data []byte) {
+	if _, err := client.writeBuffer.Write(data); err != nil {
+		log.Printf("Write buffer error fd %d: %v", client.fd, err)
+		el.close(client.fd)
+		return
+	}
+	el.enableWrite(client.fd)
+}
+
+// write flushes the client's write buffer on EVFILT_WRITE.
+func (el *EventLoop) write(fd int) {
+	client, ok := el.connections[fd]
+	if !ok {
+		return
+	}
+
+	for client.writeBuffer.Len() > 0 {
+		buf := client.writeBuffer.Bytes()
+		n, err := syscall.Write(fd, buf)
+		if n > 0 {
+			client.writeBuffer.Next(n)
+		}
+
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				return // try again later
+			}
+			log.Printf("Write error fd %d: %v", fd, err)
+			el.close(fd)
+			return
+		}
+
+		if n == 0 {
+			break
+		}
+	}
+
+	if client.writeBuffer.Len() == 0 {
+		el.disableWrite(fd)
+	}
+}
+
+func (el *EventLoop) enableWrite(fd int) {
+	client, ok := el.connections[fd]
+	if !ok || client.writeEnabled {
+		return
+	}
+
+	change := syscall.Kevent_t{
+		Ident:  uint64(fd),
+		Filter: syscall.EVFILT_WRITE,
+		Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
+	}
+	if _, err := syscall.Kevent(el.kq, []syscall.Kevent_t{change}, nil, nil); err != nil {
+		log.Printf("Failed to enable write fd %d: %v", fd, err)
+		return
+	}
+	client.writeEnabled = true
+}
+
+func (el *EventLoop) disableWrite(fd int) {
+	client, ok := el.connections[fd]
+	if !ok || !client.writeEnabled {
+		return
+	}
+
+	change := syscall.Kevent_t{
+		Ident:  uint64(fd),
+		Filter: syscall.EVFILT_WRITE,
+		Flags:  syscall.EV_DELETE,
+	}
+	if _, err := syscall.Kevent(el.kq, []syscall.Kevent_t{change}, nil, nil); err != nil {
+		log.Printf("Failed to disable write fd %d: %v", fd, err)
+	}
+	client.writeEnabled = false
 }

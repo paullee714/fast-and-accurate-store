@@ -5,12 +5,14 @@
 ## 🚀 Philosophy
 - **Fast**: High throughput leveraging Go's concurrency.
 - **Accurate**: Ensures data integrity through strict type checking.
+- **RESP-Compatible**: Uses a RESP-like protocol for binary-safe, pipelined commands.
 
 ## ✨ Key Features
 - **In-Memory Key-Value Store**: Fast data storage and retrieval.
 - **Type Safety**: Records data types at storage time and verifies them at retrieval time to prevent invalid operations.
 - **Pub/Sub Messaging**: Real-time message publishing and subscription system.
 - **Simple Protocol**: Intuitive text-based command protocol.
+- **Persistence**: Append-only file (AOF) with configurable fsync policies.
 
 ## 🛠 Getting Started
 
@@ -22,10 +24,18 @@
 ```bash
 # Start the server
 go run cmd/fas/main.go
+
+# Common flags
+#   -host          (default localhost)
+#   -port          (default 6379)
+#   -aof           (default fas.aof)
+#   -fsync         always|everysec|no (default everysec)
+#   -eventloop     use single-threaded kqueue event loop (macOS only)
+#   -maxmemory     bytes; FIFO eviction for non-TTL keys, TTL keys evicted if still over limit
 ```
 
 ### Usage (Client)
-You can use the dedicated CLI tool `fs` to communicate with the server.
+You can use the dedicated CLI tool `fs` (RESP) to communicate with the server.
 
 **1. Data Operations**
 ```bash
@@ -45,6 +55,12 @@ go run cmd/fs/main.go SUBSCRIBE news
 *Terminal 2 (Publisher)*
 ```bash
 go run cmd/fs/main.go PUBLISH news breaking_news!
+```
+
+### RESP Examples (manual)
+```
+*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
 ```
 
 ## 🧪 Testing
@@ -71,4 +87,3 @@ go test -v ./test/...
 This project is licensed under the **PolyForm Noncommercial License 1.0.0**.
 You are free to use, modify, and distribute this software for **non-commercial purposes only**.
 Commercial use is strictly prohibited without a separate commercial license.
-

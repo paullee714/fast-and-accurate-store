@@ -78,11 +78,13 @@ func (aof *AOF) Write(cmd *protocol.Command) error {
 		return err
 	}
 
+	// Always flush to OS buffer to reduce durability window
+	if err := aof.writer.Flush(); err != nil {
+		log.Printf("AOF flush error: %v", err)
+		return err
+	}
+
 	if aof.policy == FsyncAlways {
-		if err := aof.writer.Flush(); err != nil {
-			log.Printf("AOF flush error: %v", err)
-			return err
-		}
 		if err := aof.file.Sync(); err != nil {
 			log.Printf("AOF sync error: %v", err)
 			return err

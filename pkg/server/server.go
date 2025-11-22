@@ -54,22 +54,12 @@ func (s *Server) Start() error {
 
 	// Initialize AOF
 	if s.config.AOFPath != "" {
-		aof, err := persistence.NewAOF(s.config.AOFPath, s.config.FsyncPolicy)
+		aof, err := s.initAOF()
 		if err != nil {
-			return fmt.Errorf("failed to open AOF file: %v", err)
+			return err
 		}
 		s.aof = aof
 		defer s.aof.Close()
-
-		// Restore state from AOF
-		log.Println("Restoring state from AOF...")
-		err = s.aof.ReadCommands(func(cmd *protocol.Command) {
-			s.executeCommand(cmd, true) // true = replay mode (don't write to AOF again)
-		})
-		if err != nil {
-			return fmt.Errorf("failed to restore from AOF: %v", err)
-		}
-		log.Println("State restored.")
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
@@ -88,6 +78,25 @@ func (s *Server) Start() error {
 		}
 		go s.handleConnection(conn)
 	}
+}
+
+// initAOF opens the AOF file and replays its contents to restore state.
+func (s *Server) initAOF() (*persistence.AOF, error) {
+	aof, err := persistence.NewAOF(s.config.AOFPath, s.config.FsyncPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open AOF file: %v", err)
+	}
+
+	log.Println("Restoring state from AOF...")
+	if err := aof.ReadCommands(func(cmd *protocol.Command) {
+		s.executeCommand(cmd, true) // replay mode (do not re-append)
+	}); err != nil {
+		aof.Close()
+		return nil, fmt.Errorf("failed to restore from AOF: %v", err)
+	}
+	log.Println("State restored.")
+
+	return aof, nil
 }
 
 // handleConnection manages a single client connection.
@@ -130,6 +139,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 			var n int
 			fmt.Sscanf(response, "(integer) %d", &n)
 			writer.WriteInteger(n)
+		} else if response == "(nil)" {
+			writer.WriteNull()
 		} else {
 			// Default to simple string for OK, or bulk string for values?
 			// For now, let's stick to simple string for status, and bulk for data.
@@ -160,22 +171,13 @@ func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channel
 	ch := s.pubsub.Subscribe(channelName)
 	defer s.pubsub.Unsubscribe(channelName, ch)
 
-	// Send subscription confirmation
-	// Redis sends: *3\r\n$9\r\nsubscribe\r\n$len\r\nchannel\r\n:1\r\n
-	// But we are using a simplified protocol for now as per "RESP-like".
-	// Let's send a simple string or bulk string for confirmation?
-	// The previous implementation sent "Subscribed to %s\n".
-	// Let's send a bulk string "Subscribed to <channel>"
-	writer.WriteBulkString(fmt.Sprintf("Subscribed to %s", channelName))
+	// Send subscription confirmation RESP array
+	writer.WriteCommand([]string{"subscribe", channelName, "1"})
 
 	// Block and forward messages
 	for msg := range ch {
-		// Send message as bulk string
-		// Redis sends: *3\r\n$7\r\nmessage\r\n$len\r\nchannel\r\n$len\r\nmsg\r\n
-		// We will just send the message content as bulk string for simplicity,
-		// or maybe we should stick to the simple format for messages?
-		// If we use bulk string, the client (fs) will print it.
-		err := writer.WriteBulkString(msg)
+		// RESP message array: ["message", channel, payload]
+		err := writer.WriteCommand([]string{"message", channelName, msg})
 		if err != nil {
 			return // Client disconnected
 		}
