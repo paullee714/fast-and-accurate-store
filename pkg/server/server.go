@@ -16,9 +16,10 @@ import (
 
 // Config holds the configuration for the server.
 type Config struct {
-	Host    string
-	Port    int
-	AOFPath string // Path to the AOF file
+	Host        string
+	Port        int
+	AOFPath     string // Path to the AOF file
+	FsyncPolicy persistence.FsyncPolicy
 }
 
 // Server represents the TCP server instance.
@@ -44,7 +45,7 @@ func NewServer(config Config) *Server {
 func (s *Server) Start() error {
 	// Initialize AOF
 	if s.config.AOFPath != "" {
-		aof, err := persistence.NewAOF(s.config.AOFPath)
+		aof, err := persistence.NewAOF(s.config.AOFPath, s.config.FsyncPolicy)
 		if err != nil {
 			return fmt.Errorf("failed to open AOF file: %v", err)
 		}
