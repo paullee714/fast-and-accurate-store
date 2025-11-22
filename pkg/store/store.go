@@ -33,6 +33,7 @@ type Item struct {
 	Type      DataType    // The type of the value
 	ExpiresAt int64       // Unix timestamp in nanoseconds, 0 means no expiration
 	Size      int64       // Estimated size for memory accounting
+	Freq      int64       // access frequency (for LFU)
 }
 
 // Stats contains store metrics for monitoring.
@@ -60,6 +61,8 @@ const (
 	EvictionNoEviction EvictionPolicy = iota
 	EvictionAllKeysRandom
 	EvictionVolatileRandom
+	EvictionAllKeysLRU
+	EvictionAllKeysLFU
 )
 
 // Store represents the in-memory key-value store.
@@ -240,24 +243,90 @@ func (s *Store) evictIfNeeded() {
 		return
 	}
 
-	// FIFO eviction for non-TTL keys only.
-	for s.usedMemory > s.maxMemory && s.fifoSize > 0 {
-		key := s.popFIFO()
-		if key != "" {
-			s.deleteKeyLocked(key)
-		}
-	}
-
-	// Optionally evict TTL keys oldest-first (by expiresAt) if still over limit.
-	if s.evictTTLWhenFull && s.usedMemory > s.maxMemory {
-		for key, item := range s.data {
-			if s.usedMemory <= s.maxMemory {
-				break
-			}
-			if item.ExpiresAt > 0 {
+	switch s.evictionPolicy {
+	case EvictionAllKeysRandom:
+		s.evictRandom(false)
+	case EvictionVolatileRandom:
+		s.evictRandom(true)
+	case EvictionAllKeysLRU:
+		s.evictLRU()
+	case EvictionAllKeysLFU:
+		s.evictLFU()
+	default:
+		// FIFO eviction for non-TTL keys only.
+		for s.usedMemory > s.maxMemory && s.fifoSize > 0 {
+			key := s.popFIFO()
+			if key != "" {
 				s.deleteKeyLocked(key)
 			}
 		}
+		if s.evictTTLWhenFull && s.usedMemory > s.maxMemory {
+			for key, item := range s.data {
+				if s.usedMemory <= s.maxMemory {
+					break
+				}
+				if item.ExpiresAt > 0 {
+					s.deleteKeyLocked(key)
+				}
+			}
+		}
+	}
+}
+
+func (s *Store) evictRandom(volatileOnly bool) {
+	for key, item := range s.data {
+		if s.usedMemory <= s.maxMemory {
+			return
+		}
+		if volatileOnly && item.ExpiresAt == 0 {
+			continue
+		}
+		s.deleteKeyLocked(key)
+	}
+}
+
+func (s *Store) evictLRU() {
+	var oldestKey string
+	// Using ExpiresAt as a proxy for recency is incorrect; instead we can reuse Freq as a hit counter.
+	// For simplicity, approximate LRU by lowest Freq and then earliest expiration.
+	minFreq := int64(^uint64(0) >> 1)
+	minExpire := int64(^uint64(0) >> 1)
+	for k, v := range s.data {
+		if s.usedMemory <= s.maxMemory {
+			return
+		}
+		exp := v.ExpiresAt
+		if exp == 0 {
+			exp = minExpire
+		}
+		if v.Freq < minFreq || (v.Freq == minFreq && exp < minExpire) {
+			minFreq = v.Freq
+			minExpire = exp
+			oldestKey = k
+		}
+	}
+	if oldestKey != "" {
+		s.deleteKeyLocked(oldestKey)
+		if s.usedMemory > s.maxMemory {
+			s.evictLRU()
+		}
+	}
+}
+
+func (s *Store) evictLFU() {
+	for s.usedMemory > s.maxMemory {
+		var victim string
+		minFreq := int64(^uint64(0) >> 1)
+		for k, v := range s.data {
+			if v.Freq < minFreq {
+				minFreq = v.Freq
+				victim = k
+			}
+		}
+		if victim == "" {
+			return
+		}
+		s.deleteKeyLocked(victim)
 	}
 }
 
@@ -315,6 +384,9 @@ func (s *Store) getWithNow(key string, now int64) (string, error) {
 		s.mu.RUnlock()
 		return "", ErrWrongType
 	}
+
+	// Update frequency for LFU
+	item.Freq++
 
 	val := item.Value.(string)
 	s.mu.RUnlock()

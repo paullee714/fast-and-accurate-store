@@ -23,6 +23,7 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key (PEM)")
 	allowCIDR := flag.String("allow-cidr", "", "Comma-separated CIDR list to allow (optional)")
 	rdbPath := flag.String("rdb", "", "Path to snapshot (RDB) file (optional)")
+	maxClients := flag.Int("maxclients", 0, "Maximum concurrent clients (0 = unlimited)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -52,6 +53,7 @@ func main() {
 		TLSCertPath: *tlsCert,
 		TLSKeyPath:  *tlsKey,
 		RDBPath:     *rdbPath,
+		MaxClients:  *maxClients,
 	}
 
 	if *allowCIDR != "" {

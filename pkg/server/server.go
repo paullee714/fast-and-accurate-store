@@ -31,6 +31,7 @@ type Config struct {
 	TLSKeyPath  string
 	AllowedCIDR []netip.Prefix
 	RDBPath     string // Optional snapshot path; if present, load before AOF
+	MaxClients  int    // 0 = unlimited
 }
 
 // Server represents the TCP server instance.
@@ -49,6 +50,9 @@ type Server struct {
 		mu      sync.Mutex
 		running bool
 	}
+
+	muClients sync.Mutex
+	clients   int
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -99,6 +103,17 @@ func (s *Server) Start() error {
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
+		}
+		if s.config.MaxClients > 0 {
+			s.muClients.Lock()
+			if s.clients >= s.config.MaxClients {
+				s.muClients.Unlock()
+				conn.Close()
+				log.Printf("Rejecting connection: max clients reached (%d)", s.config.MaxClients)
+				continue
+			}
+			s.clients++
+			s.muClients.Unlock()
 		}
 		go s.handleConnection(conn)
 	}
@@ -197,6 +212,13 @@ func (s *Server) SaveSnapshot() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	log.Printf("New connection from %s", conn.RemoteAddr())
+	if s.config.MaxClients > 0 {
+		defer func() {
+			s.muClients.Lock()
+			s.clients--
+			s.muClients.Unlock()
+		}()
+	}
 
 	reader := bufio.NewReader(conn)
 	writer := protocol.NewWriter(conn)
