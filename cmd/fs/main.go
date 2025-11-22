@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"fas/pkg/protocol"
 )
 
 const (
@@ -24,8 +26,7 @@ func main() {
 
 	// If arguments are provided, execute single command
 	if len(os.Args) > 1 {
-		cmd := strings.Join(os.Args[1:], " ")
-		sendCommand(conn, cmd)
+		sendCommand(conn, os.Args[1:])
 		return
 	}
 
@@ -37,19 +38,21 @@ func main() {
 		if !scanner.Scan() {
 			break
 		}
-		cmd := strings.TrimSpace(scanner.Text())
-		if cmd == "" {
+		cmdLine := strings.TrimSpace(scanner.Text())
+		if cmdLine == "" {
 			continue
 		}
-		if cmd == "exit" || cmd == "quit" {
+		if cmdLine == "exit" || cmdLine == "quit" {
 			break
 		}
-		sendCommand(conn, cmd)
+		args := strings.Fields(cmdLine)
+		sendCommand(conn, args)
 	}
 }
 
-func sendCommand(conn net.Conn, cmd string) {
-	_, err := fmt.Fprintf(conn, "%s\n", cmd)
+func sendCommand(conn net.Conn, args []string) {
+	writer := protocol.NewWriter(conn)
+	err := writer.WriteCommand(args)
 	if err != nil {
 		fmt.Printf("Error sending command: %v\n", err)
 		return
@@ -57,10 +60,35 @@ func sendCommand(conn net.Conn, cmd string) {
 
 	// Read response
 	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
+	// We can use a simplified reader here or just read lines for now since we are in CLI.
+	// Ideally CLI should also parse RESP.
+	// For now, let's just print what we get to verify RESP format is working.
+	// Or better, implement a simple RESP reader for CLI.
+
+	// Let's just read everything until we get a full response.
+	// Since we don't have a full RESP parser in CLI yet (we only have it in server package),
+	// we can reuse protocol.ParseCommand? No, ParseCommand returns *Command, but response is not a Command.
+	// Response is +OK, $len\r\ndata, etc.
+
+	// For this task, let's just read line by line and print.
+	// The user will see raw RESP output which confirms the protocol change.
+	// "OK" -> "+OK"
+	// "val" -> "$3\r\nval\r\n"
+
+	text, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Printf("Error reading response: %v\n", err)
 		return
 	}
-	fmt.Print(response)
+	fmt.Print(text)
+
+	// If it's a bulk string ($...), read the data line too
+	if strings.HasPrefix(text, "$") {
+		var length int
+		fmt.Sscanf(text, "$%d", &length)
+		if length != -1 {
+			data, _ := reader.ReadString('\n')
+			fmt.Print(data)
+		}
+	}
 }

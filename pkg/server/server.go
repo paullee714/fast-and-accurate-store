@@ -86,12 +86,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	log.Printf("New connection from %s", conn.RemoteAddr())
 
 	reader := bufio.NewReader(conn)
+	writer := protocol.NewWriter(conn)
 
 	for {
 		cmd, err := protocol.ParseCommand(reader)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Read error: %v", err)
+				log.Printf("Error parsing command: %v", err)
+				writer.WriteError(err)
 			}
 			return
 		}
@@ -99,32 +101,70 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Handle SUBSCRIBE specially as it changes connection state
-		if cmd.Name == "SUBSCRIBE" {
-			s.handleSubscribe(conn, cmd)
-			return // Connection is now dedicated to subscription or closed
+		// Handle SUBSCRIBE command specially as it changes connection state
+		if strings.ToUpper(cmd.Name) == "SUBSCRIBE" {
+			if len(cmd.Args) < 1 {
+				writer.WriteError(fmt.Errorf("wrong number of arguments for 'subscribe' command"))
+				continue
+			}
+			s.handleSubscribe(conn, writer, cmd.Args)
+			continue
 		}
 
 		response := s.executeCommand(cmd, false)
-		conn.Write([]byte(response + "\n"))
+
+		// Determine response type based on content
+		if strings.HasPrefix(response, "ERR ") {
+			writer.WriteError(fmt.Errorf(strings.TrimPrefix(response, "ERR ")))
+		} else if strings.HasPrefix(response, "(integer) ") {
+			var n int
+			fmt.Sscanf(response, "(integer) %d", &n)
+			writer.WriteInteger(n)
+		} else {
+			// Default to simple string for OK, or bulk string for values?
+			// For now, let's stick to simple string for status, and bulk for data.
+			// But executeCommand returns a string. We need to refine this.
+			// To keep it simple for this refactor, let's treat "OK" as simple string, others as bulk.
+			if response == "OK" {
+				writer.WriteString(response)
+			} else {
+				writer.WriteBulkString(response)
+			}
+		}
 	}
 }
 
 // handleSubscribe handles the subscription loop for a client.
 // It blocks until the client disconnects.
-func (s *Server) handleSubscribe(conn net.Conn, cmd *protocol.Command) {
-	if len(cmd.Args) < 1 {
-		conn.Write([]byte("ERR wrong number of arguments for 'subscribe' command\n"))
+func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channels []string) {
+	// We only support single channel subscription for now based on previous implementation
+	// But args can be multiple. Let's just take the first one for now or loop.
+	// The previous implementation took one channel.
+
+	if len(channels) == 0 {
+		writer.WriteError(fmt.Errorf("wrong number of arguments for 'subscribe' command"))
 		return
 	}
 
-	channelName := cmd.Args[0]
+	channelName := channels[0]
 	ch := s.pubsub.Subscribe(channelName)
-	conn.Write([]byte(fmt.Sprintf("Subscribed to %s\n", channelName)))
+
+	// Send subscription confirmation
+	// Redis sends: *3\r\n$9\r\nsubscribe\r\n$len\r\nchannel\r\n:1\r\n
+	// But we are using a simplified protocol for now as per "RESP-like".
+	// Let's send a simple string or bulk string for confirmation?
+	// The previous implementation sent "Subscribed to %s\n".
+	// Let's send a bulk string "Subscribed to <channel>"
+	writer.WriteBulkString(fmt.Sprintf("Subscribed to %s", channelName))
 
 	// Block and forward messages
 	for msg := range ch {
-		_, err := conn.Write([]byte(msg + "\n"))
+		// Send message as bulk string
+		// Redis sends: *3\r\n$7\r\nmessage\r\n$len\r\nchannel\r\n$len\r\nmsg\r\n
+		// We will just send the message content as bulk string for simplicity,
+		// or maybe we should stick to the simple format for messages?
+		// If we use bulk string, the client (fs) will print it.
+		err := writer.WriteBulkString(msg)
 		if err != nil {
 			return // Client disconnected
 		}

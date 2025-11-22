@@ -2,10 +2,8 @@ package persistence
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 
 	"fas/pkg/protocol"
@@ -38,15 +36,16 @@ func (aof *AOF) Close() error {
 }
 
 // Write writes a command to the AOF file.
-// The format is a simple text line: "COMMAND arg1 arg2 ...\n"
+// The format is RESP.
 func (aof *AOF) Write(cmd *protocol.Command) error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 
-	// Reconstruct the command string
-	line := fmt.Sprintf("%s %s\n", cmd.Name, strings.Join(cmd.Args, " "))
-	_, err := aof.file.WriteString(line)
-	return err
+	// Reconstruct the command arguments including the name
+	args := append([]string{cmd.Name}, cmd.Args...)
+
+	writer := protocol.NewWriter(aof.file)
+	return writer.WriteCommand(args)
 }
 
 // ReadCommands reads all commands from the AOF file.
