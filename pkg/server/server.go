@@ -49,6 +49,9 @@ func NewServer(config Config) *Server {
 // Start initializes the TCP listener and starts accepting connections.
 // It blocks until the server stops or an error occurs.
 func (s *Server) Start() error {
+	// Start active expiration for store (only in multi-threaded mode)
+	s.store.StartActiveExpiration()
+
 	// Initialize AOF
 	if s.config.AOFPath != "" {
 		aof, err := persistence.NewAOF(s.config.AOFPath, s.config.FsyncPolicy)
@@ -115,7 +118,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				continue
 			}
 			s.handleSubscribe(conn, writer, cmd.Args)
-			continue
+			return // Connection is now dedicated to subscription or closed
 		}
 
 		response := s.executeCommand(cmd, false)

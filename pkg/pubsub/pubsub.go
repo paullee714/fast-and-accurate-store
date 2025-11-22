@@ -31,19 +31,19 @@ func (ps *PubSub) Subscribe(channel string) <-chan string {
 // Unsubscribe removes a subscriber from a channel.
 func (ps *PubSub) Unsubscribe(channel string, ch <-chan string) {
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
 
 	subscribers, exists := ps.channels[channel]
 	if !exists {
+		ps.mu.Unlock()
 		return
 	}
+
+	var channelToClose chan string
 
 	// Find and remove the subscriber
 	for i, sub := range subscribers {
 		if sub == ch {
-			// Close the channel to signal subscriber
-			close(sub)
-
+			channelToClose = sub
 			// Remove from list
 			ps.channels[channel] = append(subscribers[:i], subscribers[i+1:]...)
 			break
@@ -53,6 +53,15 @@ func (ps *PubSub) Unsubscribe(channel string, ch <-chan string) {
 	// Clean up empty channel list
 	if len(ps.channels[channel]) == 0 {
 		delete(ps.channels, channel)
+	}
+
+	ps.mu.Unlock()
+
+	// Close the channel after releasing the lock and removing it from the list.
+	// This ensures Publish (which holds RLock) won't find this channel in the list,
+	// avoiding sending to a closed channel.
+	if channelToClose != nil {
+		close(channelToClose)
 	}
 }
 

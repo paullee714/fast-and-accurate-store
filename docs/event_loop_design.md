@@ -30,8 +30,7 @@ Instead of spawning a goroutine for each connection, we will use a single main t
 ## Implementation Details (macOS/Kqueue)
 
 ### Dependencies
-- We will use `golang.org/x/sys/unix` for cleaner syscall access if possible, or standard `syscall` if we want zero-dependency (though `syscall` is frozen/deprecated, it works).
-- **Decision**: Use `syscall` for zero-dependency MVP, or `golang.org/x/sys/unix` if we decide to add a dependency. Given the "Fast and Accurate" goal, `unix` package is safer.
+- **Decision**: Used standard `syscall` package for zero-dependency implementation. While `syscall` is frozen, it provides the necessary `Kqueue`, `Kevent`, `Socket`, `Bind`, `Listen`, `Accept`, `Read`, `Write` primitives needed for this MVP without introducing external dependencies like `golang.org/x/sys/unix`. Future iterations may migrate to `unix` for better long-term support.
 
 ### Flow
 1.  **Start**: Create Kqueue.

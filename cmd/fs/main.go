@@ -83,7 +83,10 @@ func readAndPrintResponse(reader *bufio.Reader) {
 	// If it's a bulk string ($...), read the data line too
 	if strings.HasPrefix(text, "$") {
 		var length int
-		fmt.Sscanf(text, "$%d", &length)
+		if _, err := fmt.Sscanf(text, "$%d", &length); err != nil {
+			fmt.Printf("Error parsing bulk string length: %v\n", err)
+			os.Exit(1)
+		}
 		if length != -1 {
 			data, err := reader.ReadString('\n')
 			if err != nil {

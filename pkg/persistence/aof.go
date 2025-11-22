@@ -3,6 +3,7 @@ package persistence
 import (
 	"bufio"
 	"io"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -79,9 +80,14 @@ func (aof *AOF) Write(cmd *protocol.Command) error {
 
 	if aof.policy == FsyncAlways {
 		if err := aof.writer.Flush(); err != nil {
+			log.Printf("AOF flush error: %v", err)
 			return err
 		}
-		return aof.file.Sync()
+		if err := aof.file.Sync(); err != nil {
+			log.Printf("AOF sync error: %v", err)
+			return err
+		}
+		return nil
 	}
 
 	// For EverySec and No, we just flush to buffer (bufio handles it),
@@ -102,8 +108,12 @@ func (aof *AOF) backgroundSync() {
 		select {
 		case <-ticker.C:
 			aof.mu.Lock()
-			aof.writer.Flush()
-			aof.file.Sync()
+			if err := aof.writer.Flush(); err != nil {
+				log.Printf("AOF background flush error: %v", err)
+			}
+			if err := aof.file.Sync(); err != nil {
+				log.Printf("AOF background sync error: %v", err)
+			}
 			aof.mu.Unlock()
 		case <-aof.done:
 			return

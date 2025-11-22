@@ -59,8 +59,13 @@ func New(maxMemory int64, policy EvictionPolicy) *Store {
 		maxMemory:      maxMemory,
 		evictionPolicy: policy,
 	}
-	go s.activeExpirationLoop()
 	return s
+}
+
+// StartActiveExpiration starts the active expiration loop.
+// Should only be called in multi-threaded mode.
+func (s *Store) StartActiveExpiration() {
+	go s.activeExpirationLoop()
 }
 
 // activeExpirationLoop periodically samples keys and deletes expired ones.
@@ -167,6 +172,8 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 // It returns ErrWrongType if the stored value is not a string.
 func (s *Store) Get(key string) (string, error) {
 	s.mu.RLock()
+	// We don't defer RUnlock here because we might need to upgrade lock
+
 	item, exists := s.data[key]
 	if !exists {
 		s.mu.RUnlock()
@@ -175,15 +182,18 @@ func (s *Store) Get(key string) (string, error) {
 
 	// Lazy expiration check
 	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
-		s.mu.RUnlock() // Release read lock to acquire write lock
+		s.mu.RUnlock()
 
+		// Upgrade to write lock to delete
 		s.mu.Lock()
-		// Double-check existence and expiration after acquiring write lock
+		defer s.mu.Unlock()
+
+		// Double check after acquiring lock
 		item, exists = s.data[key]
 		if exists && item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
 			delete(s.data, key)
+			s.usedMemory -= estimateSize(key, item)
 		}
-		s.mu.Unlock()
 
 		return "", ErrNotFound
 	}
