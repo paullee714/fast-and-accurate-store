@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"strings"
@@ -89,4 +90,95 @@ func ParseCommand(reader *bufio.Reader) (*Command, error) {
 		Name: strings.ToUpper(args[0]),
 		Args: args[1:],
 	}, nil
+}
+
+// ParseCommandFromBytes parses a command from a byte slice.
+// It returns the command, the number of bytes consumed, and an error.
+// If the buffer does not contain a full command, it returns nil, 0, nil.
+func ParseCommandFromBytes(data []byte) (*Command, int, error) {
+	reader := bufio.NewReader(bytes.NewReader(data))
+
+	// Peek first byte to determine type
+	firstByte, err := reader.Peek(1)
+	if err != nil {
+		return nil, 0, nil // Not enough data
+	}
+
+	var cmd *Command
+	var consumed int
+
+	if firstByte[0] == '*' {
+		// RESP Array
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, 0, nil // Incomplete
+		}
+
+		var count int
+		if _, err := fmt.Sscanf(strings.TrimSpace(line), "*%d", &count); err != nil {
+			return nil, 0, fmt.Errorf("invalid array start: %v", err)
+		}
+
+		args := make([]string, 0, count)
+		bytesRead := len(line)
+
+		for i := 0; i < count; i++ {
+			// Read bulk string length
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return nil, 0, nil // Incomplete
+			}
+			bytesRead += len(line)
+
+			var length int
+			if _, err := fmt.Sscanf(strings.TrimSpace(line), "$%d", &length); err != nil {
+				return nil, 0, fmt.Errorf("invalid bulk string length: %v", err)
+			}
+
+			if length == -1 {
+				args = append(args, "")
+				continue
+			}
+
+			// Read data + CRLF
+			// We need length + 2 bytes
+			// Check if we have enough buffered in the underlying reader?
+			// bufio.Reader buffers, but we are reading from bytes.NewReader.
+			// We can just try to read.
+
+			data := make([]byte, length+2)
+			n, err := io.ReadFull(reader, data)
+			if err != nil {
+				return nil, 0, nil // Incomplete
+			}
+			bytesRead += n
+
+			args = append(args, string(data[:length]))
+		}
+
+		if len(args) > 0 {
+			cmd = &Command{
+				Name: args[0],
+				Args: args[1:],
+			}
+		}
+		consumed = bytesRead
+	} else {
+		// Inline command
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, 0, nil // Incomplete
+		}
+
+		parts := strings.Fields(strings.TrimSpace(line))
+		if len(parts) > 0 {
+			cmd = &Command{
+				Name: parts[0],
+				Args: parts[1:],
+			}
+		}
+		consumed = len(line)
+	}
+
+	return cmd, consumed, nil
 }

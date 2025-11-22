@@ -20,6 +20,7 @@ type Config struct {
 	Port        int
 	AOFPath     string // Path to the AOF file
 	FsyncPolicy persistence.FsyncPolicy
+	MaxMemory   int64 // Max memory in bytes
 }
 
 // Server represents the TCP server instance.
@@ -33,9 +34,14 @@ type Server struct {
 
 // NewServer creates a new Server instance with the given configuration.
 func NewServer(config Config) *Server {
+	// Default to 1GB if not set
+	if config.MaxMemory == 0 {
+		config.MaxMemory = 1024 * 1024 * 1024
+	}
+
 	return &Server{
 		config: config,
-		store:  store.New(),
+		store:  store.New(config.MaxMemory, store.EvictionAllKeysRandom),
 		pubsub: pubsub.New(),
 	}
 }

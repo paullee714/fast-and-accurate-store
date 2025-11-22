@@ -15,6 +15,7 @@ func main() {
 	aofPath := flag.String("aof", "fas.aof", "Path to AOF file")
 	fsync := flag.String("fsync", "everysec", "Fsync policy: always, everysec, no")
 	useEventLoop := flag.Bool("eventloop", false, "Use single-threaded event loop (macOS only)")
+	maxMemory := flag.Int64("maxmemory", 1024*1024*1024, "Max memory in bytes (default 1GB)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -38,6 +39,7 @@ func main() {
 		Port:        *port,
 		AOFPath:     *aofPath,
 		FsyncPolicy: policy,
+		MaxMemory:   *maxMemory,
 	}
 
 	// Initialize and start the server
