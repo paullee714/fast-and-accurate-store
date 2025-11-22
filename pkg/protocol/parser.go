@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+const (
+	maxArgs        = 1024
+	maxBulkLength  = 512 * 1024 // 512KB per bulk
+	maxInlineBytes = 8 * 1024   // 8KB inline line
+)
+
 // Command represents a parsed command from the client.
 type Command struct {
 	Name string   // The command name (e.g., "SET", "GET")
@@ -46,6 +52,9 @@ func ParseCommand(reader *bufio.Reader) (*Command, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid array length: %v", err)
 	}
+	if argc > maxArgs {
+		return nil, fmt.Errorf("too many arguments")
+	}
 
 	args := make([]string, 0, argc)
 	for i := 0; i < argc; i++ {
@@ -59,6 +68,9 @@ func ParseCommand(reader *bufio.Reader) (*Command, error) {
 		_, err = fmt.Sscanf(strings.TrimSpace(line), "$%d", &length)
 		if err != nil {
 			return nil, fmt.Errorf("invalid bulk string length: %v", err)
+		}
+		if length > maxBulkLength {
+			return nil, fmt.Errorf("bulk string too large")
 		}
 
 		if length == -1 {
@@ -112,6 +124,9 @@ func parseInline(data []byte) (*Command, int, error) {
 	if idx < 0 {
 		return nil, 0, nil
 	}
+	if idx > maxInlineBytes {
+		return nil, 0, fmt.Errorf("inline command too long")
+	}
 	line := strings.TrimSpace(string(data[:idx]))
 	if line == "" {
 		return nil, idx + 2, nil
@@ -135,6 +150,9 @@ func parseRESPArray(data []byte) (*Command, int, error) {
 	if _, err := fmt.Sscanf(string(data[1:idx]), "%d", &count); err != nil {
 		return nil, 0, fmt.Errorf("invalid array start: %v", err)
 	}
+	if count > maxArgs {
+		return nil, 0, fmt.Errorf("too many arguments")
+	}
 	pos := idx + 2
 	args := make([]string, 0, count)
 	for i := 0; i < count; i++ {
@@ -148,6 +166,9 @@ func parseRESPArray(data []byte) (*Command, int, error) {
 		var blen int
 		if _, err := fmt.Sscanf(string(data[pos+1:pos+lenEnd]), "%d", &blen); err != nil {
 			return nil, 0, fmt.Errorf("invalid bulk length: %v", err)
+		}
+		if blen > maxBulkLength {
+			return nil, 0, fmt.Errorf("bulk string too large")
 		}
 		pos += lenEnd + 2
 		if blen == -1 {

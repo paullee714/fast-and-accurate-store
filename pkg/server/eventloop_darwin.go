@@ -220,6 +220,8 @@ func (el *EventLoop) read(fd int) {
 			var n int
 			fmt.Sscanf(response, "(integer) %d", &n)
 			respData = fmt.Sprintf(":%d\r\n", n)
+		} else if response == "(nil)" {
+			respData = "$-1\r\n"
 		} else if response == "OK" {
 			respData = "+OK\r\n"
 		} else {
