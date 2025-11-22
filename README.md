@@ -50,6 +50,7 @@ go run cmd/fs/main.go PUBLISH news breaking_news!
 ## 📚 Documentation
 - [Architecture Guide](docs/architecture.md)
 - [Command Reference](docs/commands.md)
+- [Development Workflow](docs/workflow.md)
 
 ## 📄 License
 This project is licensed under the **PolyForm Noncommercial License 1.0.0**.
