@@ -94,6 +94,9 @@ func TestPubSub_NoSubscribers(t *testing.T) {
 	if count != 0 {
 		t.Errorf("Publish() count = %d, want 0", count)
 	}
+	t.Log("TestPubSub_NoSubscribers Passed")
+}
+
 func TestPubSub_Unsubscribe(t *testing.T) {
 	t.Log("Starting TestPubSub_Unsubscribe")
 	ps := pubsub.New()
@@ -127,7 +130,7 @@ func TestPubSub_SlowSubscriber(t *testing.T) {
 	t.Log("Starting TestPubSub_SlowSubscriber")
 	ps := pubsub.New()
 	channel := "slow_channel"
-	
+
 	t.Log("Step 1: Subscribing")
 	ch := ps.Subscribe(channel)
 
@@ -143,6 +146,6 @@ func TestPubSub_SlowSubscriber(t *testing.T) {
 	if count != 0 {
 		t.Errorf("Publish() count = %d, want 0 (dropped)", count)
 	}
-	
+
 	t.Log("TestPubSub_SlowSubscriber Passed")
 }
