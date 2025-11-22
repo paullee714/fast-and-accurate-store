@@ -58,27 +58,25 @@ func sendCommand(conn net.Conn, args []string) {
 		return
 	}
 
-	// Read response
 	reader := bufio.NewReader(conn)
-	// We can use a simplified reader here or just read lines for now since we are in CLI.
-	// Ideally CLI should also parse RESP.
-	// For now, let's just print what we get to verify RESP format is working.
-	// Or better, implement a simple RESP reader for CLI.
 
-	// Let's just read everything until we get a full response.
-	// Since we don't have a full RESP parser in CLI yet (we only have it in server package),
-	// we can reuse protocol.ParseCommand? No, ParseCommand returns *Command, but response is not a Command.
-	// Response is +OK, $len\r\ndata, etc.
+	// If command is SUBSCRIBE, enter continuous loop
+	if len(args) > 0 && strings.ToUpper(args[0]) == "SUBSCRIBE" {
+		fmt.Println("Reading messages... (Press Ctrl+C to quit)")
+		for {
+			readAndPrintResponse(reader)
+		}
+	} else {
+		// Single response for other commands
+		readAndPrintResponse(reader)
+	}
+}
 
-	// For this task, let's just read line by line and print.
-	// The user will see raw RESP output which confirms the protocol change.
-	// "OK" -> "+OK"
-	// "val" -> "$3\r\nval\r\n"
-
+func readAndPrintResponse(reader *bufio.Reader) {
 	text, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Printf("Error reading response: %v\n", err)
-		return
+		os.Exit(1) // Exit on connection error
 	}
 	fmt.Print(text)
 
@@ -87,7 +85,11 @@ func sendCommand(conn net.Conn, args []string) {
 		var length int
 		fmt.Sscanf(text, "$%d", &length)
 		if length != -1 {
-			data, _ := reader.ReadString('\n')
+			data, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading bulk data: %v\n", err)
+				os.Exit(1)
+			}
 			fmt.Print(data)
 		}
 	}
