@@ -18,19 +18,47 @@ func New() *PubSub {
 }
 
 // Subscribe subscribes to a channel and returns a Go channel to receive messages.
-// The returned channel has a buffer size of 10.
-func (ps *PubSub) Subscribe(channel string) chan string {
+// The returned channel has a buffer size of 100.
+func (ps *PubSub) Subscribe(channel string) <-chan string {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	ch := make(chan string, 10) // Buffer size 10
+	ch := make(chan string, 100) // Increased buffer size
 	ps.channels[channel] = append(ps.channels[channel], ch)
 	return ch
 }
 
+// Unsubscribe removes a subscriber from a channel.
+func (ps *PubSub) Unsubscribe(channel string, ch <-chan string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	subscribers, exists := ps.channels[channel]
+	if !exists {
+		return
+	}
+
+	// Find and remove the subscriber
+	for i, sub := range subscribers {
+		if sub == ch {
+			// Close the channel to signal subscriber
+			close(sub)
+
+			// Remove from list
+			ps.channels[channel] = append(subscribers[:i], subscribers[i+1:]...)
+			break
+		}
+	}
+
+	// Clean up empty channel list
+	if len(ps.channels[channel]) == 0 {
+		delete(ps.channels, channel)
+	}
+}
+
 // Publish sends a message to all subscribers of the given channel.
 // It returns the number of subscribers that received the message.
-// Note: This uses a non-blocking send, so if a subscriber is slow, they might miss messages.
+// Note: This uses a non-blocking send. If a subscriber is slow (buffer full), the message is dropped.
 func (ps *PubSub) Publish(channel string, message string) int {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
@@ -47,7 +75,7 @@ func (ps *PubSub) Publish(channel string, message string) int {
 		case ch <- message:
 			count++
 		default:
-			// Drop message if channel is full (or handle differently based on requirements)
+			// Drop message if channel is full (Backpressure: Drop)
 		}
 	}
 	return count

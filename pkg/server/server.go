@@ -149,6 +149,7 @@ func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channel
 
 	channelName := channels[0]
 	ch := s.pubsub.Subscribe(channelName)
+	defer s.pubsub.Unsubscribe(channelName, ch)
 
 	// Send subscription confirmation
 	// Redis sends: *3\r\n$9\r\nsubscribe\r\n$len\r\nchannel\r\n:1\r\n
