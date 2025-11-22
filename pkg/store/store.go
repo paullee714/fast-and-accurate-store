@@ -100,3 +100,39 @@ func (s *Store) Get(key string) (string, error) {
 	s.mu.RUnlock()
 	return val, nil
 }
+
+// UnsafeSet stores a key-value pair without locking.
+// USE ONLY IN SINGLE-THREADED CONTEXT.
+func (s *Store) UnsafeSet(key string, value string, ttl time.Duration) {
+	expiresAt := int64(0)
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl).UnixNano()
+	}
+
+	s.data[key] = &Item{
+		Value:     value,
+		Type:      TypeString,
+		ExpiresAt: expiresAt,
+	}
+}
+
+// UnsafeGet retrieves a value without locking.
+// USE ONLY IN SINGLE-THREADED CONTEXT.
+func (s *Store) UnsafeGet(key string) (string, error) {
+	item, exists := s.data[key]
+	if !exists {
+		return "", ErrNotFound
+	}
+
+	// Lazy expiration check
+	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
+		delete(s.data, key)
+		return "", ErrNotFound
+	}
+
+	if item.Type != TypeString {
+		return "", ErrWrongType
+	}
+
+	return item.Value.(string), nil
+}

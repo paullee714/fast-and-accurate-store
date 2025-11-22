@@ -14,6 +14,7 @@ func main() {
 	port := flag.Int("port", 6379, "Port to listen on")
 	aofPath := flag.String("aof", "fas.aof", "Path to AOF file")
 	fsync := flag.String("fsync", "everysec", "Fsync policy: always, everysec, no")
+	useEventLoop := flag.Bool("eventloop", false, "Use single-threaded event loop (macOS only)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -41,7 +42,17 @@ func main() {
 
 	// Initialize and start the server
 	srv := server.NewServer(config)
-	if err := srv.Start(); err != nil {
+
+	var err error
+	if *useEventLoop {
+		log.Println("Using Single Threaded Event Loop (Netpoll)")
+		err = srv.StartEventLoop()
+	} else {
+		log.Println("Using Standard Goroutine-per-Connection")
+		err = srv.Start()
+	}
+
+	if err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
