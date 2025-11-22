@@ -31,7 +31,7 @@ var (
 type Item struct {
 	Value     interface{} // The actual value stored
 	Type      DataType    // The type of the value
-	ExpiresAt int64       // Unix timestamp for expiration, 0 means no expiration
+	ExpiresAt int64       // Unix timestamp in nanoseconds, 0 means no expiration
 }
 
 // Store is a thread-safe in-memory key-value store.
@@ -55,7 +55,7 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 
 	expiresAt := int64(0)
 	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).Unix()
+		expiresAt = time.Now().Add(ttl).UnixNano()
 	}
 
 	s.data[key] = &Item{
@@ -78,7 +78,7 @@ func (s *Store) Get(key string) (string, error) {
 	}
 
 	// Lazy expiration check
-	if item.ExpiresAt > 0 && time.Now().Unix() > item.ExpiresAt {
+	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
 		delete(s.data, key)
 		return "", ErrNotFound
 	}
