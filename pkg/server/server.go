@@ -25,6 +25,7 @@ type Config struct {
 	AOFPath     string // Path to the AOF file
 	FsyncPolicy persistence.FsyncPolicy
 	MaxMemory   int64 // Max memory in bytes
+	Eviction    store.EvictionPolicy
 	AuthEnabled bool
 	Password    string // Optional password for AUTH
 	TLSCertPath string
@@ -32,6 +33,23 @@ type Config struct {
 	AllowedCIDR []netip.Prefix
 	RDBPath     string // Optional snapshot path; if present, load before AOF
 	MaxClients  int    // 0 = unlimited
+}
+
+// ValidateAndFill sets defaults and validates combinations.
+func (c *Config) ValidateAndFill() error {
+	if c.MaxMemory == 0 {
+		c.MaxMemory = 1024 * 1024 * 1024
+	}
+	if c.Eviction == 0 {
+		c.Eviction = store.EvictionAllKeysRandom
+	}
+	if c.AuthEnabled && c.Password == "" {
+		return fmt.Errorf("auth enabled but no password provided")
+	}
+	if (c.TLSCertPath == "") != (c.TLSKeyPath == "") {
+		return fmt.Errorf("both tls-cert and tls-key must be provided together")
+	}
+	return nil
 }
 
 // Server represents the TCP server instance.
@@ -57,14 +75,11 @@ type Server struct {
 
 // NewServer creates a new Server instance with the given configuration.
 func NewServer(config Config) *Server {
-	// Default to 1GB if not set
-	if config.MaxMemory == 0 {
-		config.MaxMemory = 1024 * 1024 * 1024
-	}
+	_ = config.ValidateAndFill()
 
 	return &Server{
 		config: config,
-		store:  store.New(config.MaxMemory, store.EvictionAllKeysRandom),
+		store:  store.New(config.MaxMemory, config.Eviction),
 		pubsub: pubsub.New(),
 	}
 }
