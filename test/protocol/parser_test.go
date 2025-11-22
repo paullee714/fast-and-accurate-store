@@ -61,19 +61,27 @@ func TestParseCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Logf("Testing case: %s", tt.name)
+			t.Logf("Input: %q", tt.input)
+
 			reader := bufio.NewReader(strings.NewReader(tt.input))
 			got, err := protocol.ParseCommand(reader)
+
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParseCommand() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got == nil && tt.want == nil {
+				t.Log("Result: Got nil as expected")
 				return
 			}
 			if got == nil || tt.want == nil {
 				t.Errorf("ParseCommand() = %v, want %v", got, tt.want)
 				return
 			}
+
+			t.Logf("Parsed Command: Name=%s, Args=%v", got.Name, got.Args)
+
 			if got.Name != tt.want.Name {
 				t.Errorf("ParseCommand() Name = %v, want %v", got.Name, tt.want.Name)
 			}
