@@ -70,22 +70,33 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 // It returns ErrWrongType if the stored value is not a string.
 func (s *Store) Get(key string) (string, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	item, exists := s.data[key]
 	if !exists {
+		s.mu.RUnlock()
 		return "", ErrNotFound
 	}
 
 	// Lazy expiration check
 	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
-		delete(s.data, key)
+		s.mu.RUnlock() // Release read lock to acquire write lock
+
+		s.mu.Lock()
+		// Double-check existence and expiration after acquiring write lock
+		item, exists = s.data[key]
+		if exists && item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
+			delete(s.data, key)
+		}
+		s.mu.Unlock()
+
 		return "", ErrNotFound
 	}
 
 	if item.Type != TypeString {
+		s.mu.RUnlock()
 		return "", ErrWrongType
 	}
 
-	return item.Value.(string), nil
+	val := item.Value.(string)
+	s.mu.RUnlock()
+	return val, nil
 }
