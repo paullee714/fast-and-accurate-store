@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/list"
 	"errors"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ type Item struct {
 	Value     interface{} // The actual value stored
 	Type      DataType    // The type of the value
 	ExpiresAt int64       // Unix timestamp in nanoseconds, 0 means no expiration
+	Size      int64       // Estimated size for memory accounting
 }
 
 // EvictionPolicy defines how to select keys to evict when max memory is reached.
@@ -50,6 +52,9 @@ type Store struct {
 	maxMemory      int64
 	usedMemory     int64
 	evictionPolicy EvictionPolicy
+
+	fifoList  *list.List               // insertion order for non-TTL keys
+	fifoIndex map[string]*list.Element // key -> element in fifoList
 }
 
 // New creates a new Store instance.
@@ -58,6 +63,8 @@ func New(maxMemory int64, policy EvictionPolicy) *Store {
 		data:           make(map[string]*Item),
 		maxMemory:      maxMemory,
 		evictionPolicy: policy,
+		fifoList:       list.New(),
+		fifoIndex:      make(map[string]*list.Element),
 	}
 	return s
 }
@@ -88,18 +95,16 @@ func (s *Store) activeExpire() {
 
 	// Sample 20 keys
 	sampleSize := 20
-	expiredCount := 0
 
 	// Go map iteration is random
 	count := 0
+	now := time.Now().UnixNano()
 	for key, item := range s.data {
 		if count >= sampleSize {
 			break
 		}
-		if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
-			delete(s.data, key)
-			s.usedMemory -= estimateSize(key, item)
-			expiredCount++
+		if item.ExpiresAt > 0 && now > item.ExpiresAt {
+			s.deleteKeyLocked(key)
 		}
 		count++
 	}
@@ -114,26 +119,20 @@ func estimateSize(key string, item *Item) int64 {
 	return size
 }
 
+func estimateItemSize(key string, value string) int64 {
+	return int64(len(key)) + 100 + int64(len(value))
+}
+
 func (s *Store) evictIfNeeded() {
 	if s.maxMemory <= 0 || s.usedMemory <= s.maxMemory {
 		return
 	}
 
-	// Simple random eviction
-	// Note: Go map iteration order is not guaranteed to be random,
-	// but for a simple implementation, iterating and deleting is sufficient.
-	// For true random eviction, keys would need to be stored in a separate data structure.
-	for k, v := range s.data {
-		if s.usedMemory <= s.maxMemory {
-			break
-		}
-		// If policy is volatile, only evict if has TTL
-		if s.evictionPolicy == EvictionVolatileRandom && v.ExpiresAt == 0 {
-			continue
-		}
-
-		delete(s.data, k)
-		s.usedMemory -= estimateSize(k, v)
+	// FIFO eviction for non-TTL keys only.
+	for s.usedMemory > s.maxMemory && s.fifoList.Len() > 0 {
+		elem := s.fifoList.Front()
+		key := elem.Value.(string)
+		s.deleteKeyLocked(key)
 	}
 }
 
@@ -142,29 +141,7 @@ func (s *Store) evictIfNeeded() {
 func (s *Store) Set(key string, value string, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	expiresAt := int64(0)
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UnixNano()
-	}
-
-	newItem := &Item{
-		Value:     value,
-		Type:      TypeString,
-		ExpiresAt: expiresAt,
-	}
-
-	// Calculate size delta
-	newSize := estimateSize(key, newItem)
-	oldSize := int64(0)
-	if oldItem, exists := s.data[key]; exists {
-		oldSize = estimateSize(key, oldItem)
-	}
-
-	s.usedMemory += newSize - oldSize
-	s.data[key] = newItem
-
-	s.evictIfNeeded()
+	s.setUnlocked(key, value, ttl)
 }
 
 // Get retrieves the value associated with the given key.
@@ -181,7 +158,8 @@ func (s *Store) Get(key string) (string, error) {
 	}
 
 	// Lazy expiration check
-	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
+	now := time.Now().UnixNano()
+	if item.ExpiresAt > 0 && now > item.ExpiresAt {
 		s.mu.RUnlock()
 
 		// Upgrade to write lock to delete
@@ -190,9 +168,8 @@ func (s *Store) Get(key string) (string, error) {
 
 		// Double check after acquiring lock
 		item, exists = s.data[key]
-		if exists && item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
-			delete(s.data, key)
-			s.usedMemory -= estimateSize(key, item)
+		if exists && item.ExpiresAt > 0 && now > item.ExpiresAt {
+			s.deleteKeyLocked(key)
 		}
 
 		return "", ErrNotFound
@@ -211,41 +188,8 @@ func (s *Store) Get(key string) (string, error) {
 // UnsafeSet stores a key-value pair without locking.
 // USE ONLY IN SINGLE-THREADED CONTEXT.
 func (s *Store) UnsafeSet(key string, value string, ttl time.Duration) {
-	expiresAt := int64(0)
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UnixNano()
-	}
-
-	newItem := &Item{
-		Value:     value,
-		Type:      TypeString,
-		ExpiresAt: expiresAt,
-	}
-
-	newSize := estimateSize(key, newItem)
-	oldSize := int64(0)
-	if oldItem, exists := s.data[key]; exists {
-		oldSize = estimateSize(key, oldItem)
-	}
-
-	s.usedMemory += newSize - oldSize
-	s.data[key] = newItem
-
-	// For unsafe, we assume the caller handles eviction or we call it here?
-	// Since UnsafeSet is used in EventLoop which is single threaded, we can call evictIfNeeded.
-	// But evictIfNeeded uses range loop which is safe in single thread.
-	// However, evictIfNeeded currently doesn't lock, but s.data access is safe.
-	// Wait, evictIfNeeded is not exported and assumes lock is held if called from Set.
-	// But UnsafeSet doesn't hold lock.
-	// We should make a version of evictIfNeeded that doesn't lock?
-	// Actually evictIfNeeded DOES NOT lock itself, it expects lock to be held.
-	// So calling it from UnsafeSet is fine as long as no other thread is accessing data.
-	// But wait, activeExpirationLoop runs in background and locks!
-	// If we use EventLoop, we shouldn't use activeExpirationLoop with locks?
-	// Or we should disable activeExpirationLoop in EventLoop mode?
-	// Yes, in EventLoop mode, active expiration should be done as an event or periodic check in the loop, not a separate goroutine with locks.
-
-	// For now, let's just update memory usage.
+	// Caller must ensure exclusive access.
+	s.setUnlocked(key, value, ttl)
 }
 
 // UnsafeGet retrieves a value without locking.
@@ -258,7 +202,7 @@ func (s *Store) UnsafeGet(key string) (string, error) {
 
 	// Lazy expiration check
 	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
-		delete(s.data, key)
+		s.deleteKeyUnlocked(key)
 		return "", ErrNotFound
 	}
 
@@ -267,4 +211,68 @@ func (s *Store) UnsafeGet(key string) (string, error) {
 	}
 
 	return item.Value.(string), nil
+}
+
+// setUnlocked sets a key without taking a lock. Caller must manage locking or exclusivity.
+func (s *Store) setUnlocked(key string, value string, ttl time.Duration) {
+	expiresAt := int64(0)
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl).UnixNano()
+	}
+
+	newItem := &Item{
+		Value:     value,
+		Type:      TypeString,
+		ExpiresAt: expiresAt,
+		Size:      estimateItemSize(key, value),
+	}
+
+	// Remove existing entry accounting
+	if oldItem, exists := s.data[key]; exists {
+		s.usedMemory -= oldItem.Size
+		if oldItem.ExpiresAt == 0 {
+			s.removeFIFOUnlocked(key)
+		}
+	}
+
+	s.data[key] = newItem
+	s.usedMemory += newItem.Size
+
+	if ttl == 0 {
+		s.addFIFOUnlocked(key)
+	} else {
+		s.removeFIFOUnlocked(key)
+	}
+
+	s.evictIfNeeded()
+}
+
+// deleteKeyLocked deletes a key and updates tracking structures. Caller must hold write lock.
+func (s *Store) deleteKeyLocked(key string) {
+	s.deleteKeyUnlocked(key)
+}
+
+// deleteKeyUnlocked deletes key without acquiring locks. Caller must ensure safety.
+func (s *Store) deleteKeyUnlocked(key string) {
+	if item, exists := s.data[key]; exists {
+		s.usedMemory -= item.Size
+		if item.ExpiresAt == 0 {
+			s.removeFIFOUnlocked(key)
+		}
+		delete(s.data, key)
+	}
+}
+
+func (s *Store) addFIFOUnlocked(key string) {
+	if elem, ok := s.fifoIndex[key]; ok {
+		s.fifoList.Remove(elem)
+	}
+	s.fifoIndex[key] = s.fifoList.PushBack(key)
+}
+
+func (s *Store) removeFIFOUnlocked(key string) {
+	if elem, ok := s.fifoIndex[key]; ok {
+		s.fifoList.Remove(elem)
+		delete(s.fifoIndex, key)
+	}
 }

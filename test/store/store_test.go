@@ -93,3 +93,24 @@ func TestStore_NotFound(t *testing.T) {
 	}
 	t.Log("TestStore_NotFound Passed")
 }
+
+func TestStore_NonTTL_FIFO_EvictsOldest(t *testing.T) {
+	t.Log("Starting TestStore_NonTTL_FIFO_EvictsOldest")
+	s := store.New(150, store.EvictionNoEviction) // small cap forces eviction
+
+	t.Log("Step 1: Setting first non-TTL key")
+	s.Set("k1", "v1", 0)
+
+	t.Log("Step 2: Setting second non-TTL key (should evict k1 due to FIFO and memory cap)")
+	s.Set("k2", "v2", 0)
+
+	t.Log("Step 3: Verifying k1 was evicted")
+	if _, err := s.Get("k1"); err != store.ErrNotFound {
+		t.Fatalf("expected k1 to be evicted, got err=%v", err)
+	}
+
+	t.Log("Step 4: Verifying k2 remains")
+	if v, err := s.Get("k2"); err != nil || v != "v2" {
+		t.Fatalf("k2 missing or wrong: v=%q err=%v", v, err)
+	}
+}
