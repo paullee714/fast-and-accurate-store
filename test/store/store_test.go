@@ -1,12 +1,14 @@
-package store
+package store_test
 
 import (
 	"testing"
 	"time"
+
+	"fas/pkg/store"
 )
 
 func TestStore_SetGet(t *testing.T) {
-	s := New()
+	s := store.New()
 
 	key := "test_key"
 	value := "test_value"
@@ -23,7 +25,7 @@ func TestStore_SetGet(t *testing.T) {
 }
 
 func TestStore_Expiration(t *testing.T) {
-	s := New()
+	s := store.New()
 
 	key := "expire_key"
 	value := "expire_value"
@@ -42,23 +44,17 @@ func TestStore_Expiration(t *testing.T) {
 
 	// Verify it's gone
 	_, err = s.Get(key)
-	if err != ErrNotFound {
-		t.Errorf("Get() after expiration error = %v, want %v", err, ErrNotFound)
+	if err != store.ErrNotFound {
+		t.Errorf("Get() after expiration error = %v, want %v", err, store.ErrNotFound)
 	}
 }
 
 func TestStore_TypeSafety(t *testing.T) {
-	s := New()
+	s := store.New()
 	key := "string_key"
 	s.Set(key, "value", 0)
 
-	// Manually inject a wrong type to test safety (simulating internal corruption or future list implementation)
-	// Since we can't easily inject wrong type via public API yet without other methods,
-	// we rely on the fact that Set currently only supports String.
-	// So we verify that Get returns string and no error for now.
-	// Ideally, if we had List support, we would SetList and try Get (String), expecting ErrWrongType.
-
-	// For now, let's just verify standard behavior is type safe for strings
+	// Verify standard behavior is type safe for strings
 	val, err := s.Get(key)
 	if err != nil {
 		t.Errorf("Get() error = %v", err)
@@ -69,9 +65,9 @@ func TestStore_TypeSafety(t *testing.T) {
 }
 
 func TestStore_NotFound(t *testing.T) {
-	s := New()
+	s := store.New()
 	_, err := s.Get("non_existent")
-	if err != ErrNotFound {
-		t.Errorf("Get() error = %v, want %v", err, ErrNotFound)
+	if err != store.ErrNotFound {
+		t.Errorf("Get() error = %v, want %v", err, store.ErrNotFound)
 	}
 }

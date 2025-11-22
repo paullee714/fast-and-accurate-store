@@ -1,20 +1,22 @@
-package pubsub
+package pubsub_test
 
 import (
 	"sync"
 	"testing"
 	"time"
+
+	"fas/pkg/pubsub"
 )
 
 func TestPubSub_SubscribePublish(t *testing.T) {
-	ps := New()
+	ps := pubsub.New()
 	channel := "test_channel"
 	msg := "hello"
 
 	// Subscribe
 	ch := ps.Subscribe(channel)
 
-	// Publish in a goroutine to avoid blocking if channel was unbuffered (though it is buffered)
+	// Publish in a goroutine
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -39,7 +41,7 @@ func TestPubSub_SubscribePublish(t *testing.T) {
 }
 
 func TestPubSub_MultipleSubscribers(t *testing.T) {
-	ps := New()
+	ps := pubsub.New()
 	channel := "multi_channel"
 	msg := "broadcast"
 
@@ -73,7 +75,7 @@ func TestPubSub_MultipleSubscribers(t *testing.T) {
 }
 
 func TestPubSub_NoSubscribers(t *testing.T) {
-	ps := New()
+	ps := pubsub.New()
 	count := ps.Publish("empty_channel", "msg")
 	if count != 0 {
 		t.Errorf("Publish() count = %d, want 0", count)

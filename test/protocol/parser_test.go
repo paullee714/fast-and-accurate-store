@@ -1,22 +1,24 @@
-package protocol
+package protocol_test
 
 import (
 	"bufio"
 	"strings"
 	"testing"
+
+	"fas/pkg/protocol"
 )
 
 func TestParseCommand(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
-		want    *Command
+		want    *protocol.Command
 		wantErr bool
 	}{
 		{
 			name:  "Simple SET",
 			input: "SET key value\n",
-			want: &Command{
+			want: &protocol.Command{
 				Name: "SET",
 				Args: []string{"key", "value"},
 			},
@@ -25,7 +27,7 @@ func TestParseCommand(t *testing.T) {
 		{
 			name:  "GET with one arg",
 			input: "GET key\n",
-			want: &Command{
+			want: &protocol.Command{
 				Name: "GET",
 				Args: []string{"key"},
 			},
@@ -34,7 +36,7 @@ func TestParseCommand(t *testing.T) {
 		{
 			name:  "Case Insensitive",
 			input: "set key value\n",
-			want: &Command{
+			want: &protocol.Command{
 				Name: "SET",
 				Args: []string{"key", "value"},
 			},
@@ -49,7 +51,7 @@ func TestParseCommand(t *testing.T) {
 		{
 			name:  "Multiple Spaces",
 			input: "SET   key    value\n",
-			want: &Command{
+			want: &protocol.Command{
 				Name: "SET",
 				Args: []string{"key", "value"},
 			},
@@ -60,7 +62,7 @@ func TestParseCommand(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReader(strings.NewReader(tt.input))
-			got, err := ParseCommand(reader)
+			got, err := protocol.ParseCommand(reader)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParseCommand() error = %v, wantErr %v", err, tt.wantErr)
 				return
