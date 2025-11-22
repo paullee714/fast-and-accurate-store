@@ -1,7 +1,6 @@
 package store
 
 import (
-	"container/list"
 	"errors"
 	"sync"
 	"time"
@@ -53,18 +52,27 @@ type Store struct {
 	usedMemory     int64
 	evictionPolicy EvictionPolicy
 
-	fifoList  *list.List               // insertion order for non-TTL keys
-	fifoIndex map[string]*list.Element // key -> element in fifoList
+	// Non-TTL FIFO ring buffer
+	fifoKeys []string
+	fifoHead int // index of oldest
+	fifoTail int // index to write next
+	fifoSize int // number of valid entries
+	fifoCap  int
+	tombs    int // tombstones to trigger compaction
+
+	// Optional: when true, allow eviction of TTL keys after FIFO is empty to honor maxMemory.
+	evictTTLWhenFull bool
 }
 
 // New creates a new Store instance.
 func New(maxMemory int64, policy EvictionPolicy) *Store {
 	s := &Store{
-		data:           make(map[string]*Item),
-		maxMemory:      maxMemory,
-		evictionPolicy: policy,
-		fifoList:       list.New(),
-		fifoIndex:      make(map[string]*list.Element),
+		data:             make(map[string]*Item),
+		maxMemory:        maxMemory,
+		evictionPolicy:   policy,
+		fifoCap:          1024,
+		fifoKeys:         make([]string, 1024),
+		evictTTLWhenFull: true,
 	}
 	return s
 }
@@ -99,14 +107,25 @@ func (s *Store) activeExpire() {
 	// Go map iteration is random
 	count := 0
 	now := time.Now().UnixNano()
+	expired := 0
 	for key, item := range s.data {
 		if count >= sampleSize {
 			break
 		}
 		if item.ExpiresAt > 0 && now > item.ExpiresAt {
 			s.deleteKeyLocked(key)
+			expired++
 		}
 		count++
+	}
+
+	// Adaptive: if majority of sampled keys are expired, do an extra pass to avoid lag.
+	if expired > sampleSize/2 {
+		for key, item := range s.data {
+			if item.ExpiresAt > 0 && now > item.ExpiresAt {
+				s.deleteKeyLocked(key)
+			}
+		}
 	}
 }
 
@@ -120,7 +139,7 @@ func estimateSize(key string, item *Item) int64 {
 }
 
 func estimateItemSize(key string, value string) int64 {
-	return int64(len(key)) + 100 + int64(len(value))
+	return int64(len(key)+len(value)) + 100
 }
 
 func (s *Store) evictIfNeeded() {
@@ -129,10 +148,23 @@ func (s *Store) evictIfNeeded() {
 	}
 
 	// FIFO eviction for non-TTL keys only.
-	for s.usedMemory > s.maxMemory && s.fifoList.Len() > 0 {
-		elem := s.fifoList.Front()
-		key := elem.Value.(string)
-		s.deleteKeyLocked(key)
+	for s.usedMemory > s.maxMemory && s.fifoSize > 0 {
+		key := s.popFIFO()
+		if key != "" {
+			s.deleteKeyLocked(key)
+		}
+	}
+
+	// Optionally evict TTL keys oldest-first (by expiresAt) if still over limit.
+	if s.evictTTLWhenFull && s.usedMemory > s.maxMemory {
+		for key, item := range s.data {
+			if s.usedMemory <= s.maxMemory {
+				break
+			}
+			if item.ExpiresAt > 0 {
+				s.deleteKeyLocked(key)
+			}
+		}
 	}
 }
 
@@ -148,30 +180,40 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 // It returns ErrNotFound if the key does not exist or has expired.
 // It returns ErrWrongType if the stored value is not a string.
 func (s *Store) Get(key string) (string, error) {
-	s.mu.RLock()
-	// We don't defer RUnlock here because we might need to upgrade lock
+	now := time.Now().UnixNano()
+	return s.getWithNow(key, now)
+}
 
+// UnsafeSet stores a key-value pair without locking.
+// USE ONLY IN SINGLE-THREADED CONTEXT.
+func (s *Store) UnsafeSet(key string, value string, ttl time.Duration) {
+	// Caller must ensure exclusive access.
+	s.setUnlocked(key, value, ttl)
+}
+
+// UnsafeGet retrieves a value without locking.
+// USE ONLY IN SINGLE-THREADED CONTEXT.
+func (s *Store) UnsafeGet(key string) (string, error) {
+	now := time.Now().UnixNano()
+	return s.getUnlockedWithNow(key, now)
+}
+
+func (s *Store) getWithNow(key string, now int64) (string, error) {
+	s.mu.RLock()
 	item, exists := s.data[key]
 	if !exists {
 		s.mu.RUnlock()
 		return "", ErrNotFound
 	}
 
-	// Lazy expiration check
-	now := time.Now().UnixNano()
 	if item.ExpiresAt > 0 && now > item.ExpiresAt {
 		s.mu.RUnlock()
-
-		// Upgrade to write lock to delete
 		s.mu.Lock()
 		defer s.mu.Unlock()
-
-		// Double check after acquiring lock
 		item, exists = s.data[key]
 		if exists && item.ExpiresAt > 0 && now > item.ExpiresAt {
-			s.deleteKeyLocked(key)
+			s.deleteKeyUnlocked(key)
 		}
-
 		return "", ErrNotFound
 	}
 
@@ -185,31 +227,18 @@ func (s *Store) Get(key string) (string, error) {
 	return val, nil
 }
 
-// UnsafeSet stores a key-value pair without locking.
-// USE ONLY IN SINGLE-THREADED CONTEXT.
-func (s *Store) UnsafeSet(key string, value string, ttl time.Duration) {
-	// Caller must ensure exclusive access.
-	s.setUnlocked(key, value, ttl)
-}
-
-// UnsafeGet retrieves a value without locking.
-// USE ONLY IN SINGLE-THREADED CONTEXT.
-func (s *Store) UnsafeGet(key string) (string, error) {
+func (s *Store) getUnlockedWithNow(key string, now int64) (string, error) {
 	item, exists := s.data[key]
 	if !exists {
 		return "", ErrNotFound
 	}
-
-	// Lazy expiration check
-	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
+	if item.ExpiresAt > 0 && now > item.ExpiresAt {
 		s.deleteKeyUnlocked(key)
 		return "", ErrNotFound
 	}
-
 	if item.Type != TypeString {
 		return "", ErrWrongType
 	}
-
 	return item.Value.(string), nil
 }
 
@@ -264,15 +293,94 @@ func (s *Store) deleteKeyUnlocked(key string) {
 }
 
 func (s *Store) addFIFOUnlocked(key string) {
-	if elem, ok := s.fifoIndex[key]; ok {
-		s.fifoList.Remove(elem)
+	s.ensureFIFOCap()
+	s.fifoKeys[s.fifoTail] = key
+	s.fifoTail = (s.fifoTail + 1) % s.fifoCap
+	if s.fifoSize < s.fifoCap {
+		s.fifoSize++
+	} else {
+		// overwrote oldest
+		s.fifoHead = (s.fifoHead + 1) % s.fifoCap
 	}
-	s.fifoIndex[key] = s.fifoList.PushBack(key)
 }
 
 func (s *Store) removeFIFOUnlocked(key string) {
-	if elem, ok := s.fifoIndex[key]; ok {
-		s.fifoList.Remove(elem)
-		delete(s.fifoIndex, key)
+	for i, cnt := s.fifoHead, 0; cnt < s.fifoSize; cnt++ {
+		if s.fifoKeys[i] == key {
+			s.fifoKeys[i] = "" // tombstone
+			s.tombs++
+			break
+		}
+		i++
+		if i == s.fifoCap {
+			i = 0
+		}
 	}
+	s.compactIfNeeded()
+}
+
+// popFIFO pops the oldest non-tombstone key, compacting tombstones on the way.
+func (s *Store) popFIFO() string {
+	for s.fifoSize > 0 {
+		key := s.fifoKeys[s.fifoHead]
+		s.fifoKeys[s.fifoHead] = ""
+		s.fifoHead = (s.fifoHead + 1) % s.fifoCap
+		s.fifoSize--
+		if key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+func (s *Store) ensureFIFOCap() {
+	if s.fifoSize < s.fifoCap-1 {
+		return
+	}
+	oldCap := s.fifoCap
+	newCap := oldCap * 2
+	newKeys := make([]string, newCap)
+	// copy in order
+	idx := 0
+	for i, cnt := s.fifoHead, 0; cnt < s.fifoSize; cnt++ {
+		newKeys[idx] = s.fifoKeys[i]
+		idx++
+		i++
+		if i == oldCap {
+			i = 0
+		}
+	}
+	s.fifoKeys = newKeys
+	s.fifoHead = 0
+	s.fifoTail = s.fifoSize
+	s.fifoCap = newCap
+	s.tombs = 0
+}
+
+func (s *Store) compactIfNeeded() {
+	if s.fifoSize == 0 {
+		s.fifoHead, s.fifoTail, s.tombs = 0, 0, 0
+		return
+	}
+	if s.tombs < s.fifoSize/2 {
+		return
+	}
+	oldCap := s.fifoCap
+	newKeys := make([]string, oldCap)
+	idx := 0
+	for i, cnt := s.fifoHead, 0; cnt < s.fifoSize; cnt++ {
+		if s.fifoKeys[i] != "" {
+			newKeys[idx] = s.fifoKeys[i]
+			idx++
+		}
+		i++
+		if i == oldCap {
+			i = 0
+		}
+	}
+	s.fifoKeys = newKeys
+	s.fifoHead = 0
+	s.fifoTail = idx
+	s.fifoSize = idx
+	s.tombs = 0
 }
