@@ -2,11 +2,15 @@ package server
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
+	"os"
 	"strings"
+	"sync"
 
 	"fas/pkg/persistence"
 	"fas/pkg/protocol"
@@ -21,6 +25,31 @@ type Config struct {
 	AOFPath     string // Path to the AOF file
 	FsyncPolicy persistence.FsyncPolicy
 	MaxMemory   int64 // Max memory in bytes
+	Eviction    store.EvictionPolicy
+	AuthEnabled bool
+	Password    string // Optional password for AUTH
+	TLSCertPath string
+	TLSKeyPath  string
+	AllowedCIDR []netip.Prefix
+	RDBPath     string // Optional snapshot path; if present, load before AOF
+	MaxClients  int    // 0 = unlimited
+}
+
+// ValidateAndFill sets defaults and validates combinations.
+func (c *Config) ValidateAndFill() error {
+	if c.MaxMemory == 0 {
+		c.MaxMemory = 1024 * 1024 * 1024
+	}
+	if c.Eviction == 0 {
+		c.Eviction = store.EvictionAllKeysRandom
+	}
+	if c.AuthEnabled && c.Password == "" {
+		return fmt.Errorf("auth enabled but no password provided")
+	}
+	if (c.TLSCertPath == "") != (c.TLSKeyPath == "") {
+		return fmt.Errorf("both tls-cert and tls-key must be provided together")
+	}
+	return nil
 }
 
 // Server represents the TCP server instance.
@@ -30,18 +59,27 @@ type Server struct {
 	store  *store.Store
 	pubsub *pubsub.PubSub
 	aof    *persistence.AOF
+
+	stats struct {
+		expired int64
+	}
+
+	bgSave struct {
+		mu      sync.Mutex
+		running bool
+	}
+
+	muClients sync.Mutex
+	clients   int
 }
 
 // NewServer creates a new Server instance with the given configuration.
 func NewServer(config Config) *Server {
-	// Default to 1GB if not set
-	if config.MaxMemory == 0 {
-		config.MaxMemory = 1024 * 1024 * 1024
-	}
+	_ = config.ValidateAndFill()
 
 	return &Server{
 		config: config,
-		store:  store.New(config.MaxMemory, store.EvictionAllKeysRandom),
+		store:  store.New(config.MaxMemory, config.Eviction),
 		pubsub: pubsub.New(),
 	}
 }
@@ -52,29 +90,45 @@ func (s *Server) Start() error {
 	// Start active expiration for store (only in multi-threaded mode)
 	s.store.StartActiveExpiration()
 
-	// Initialize AOF
-	if s.config.AOFPath != "" {
-		aof, err := s.initAOF()
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	var ln net.Listener
+	var err error
+	if s.config.TLSCertPath != "" && s.config.TLSKeyPath != "" {
+		cer, loadErr := tls.LoadX509KeyPair(s.config.TLSCertPath, s.config.TLSKeyPath)
+		if loadErr != nil {
+			return fmt.Errorf("failed to load TLS cert/key: %v", loadErr)
+		}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cer}}
+		ln, err = tls.Listen("tcp", addr, tlsCfg)
 		if err != nil {
 			return err
 		}
-		s.aof = aof
-		defer s.aof.Close()
-	}
-
-	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+		log.Printf("Listening with TLS on %s", addr)
+	} else {
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		log.Printf("Listening on %s", addr)
 	}
 	s.ln = ln
-	log.Printf("Listening on %s", addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
+		}
+		if s.config.MaxClients > 0 {
+			s.muClients.Lock()
+			if s.clients >= s.config.MaxClients {
+				s.muClients.Unlock()
+				conn.Close()
+				log.Printf("Rejecting connection: max clients reached (%d)", s.config.MaxClients)
+				continue
+			}
+			s.clients++
+			s.muClients.Unlock()
 		}
 		go s.handleConnection(conn)
 	}
@@ -99,13 +153,96 @@ func (s *Server) initAOF() (*persistence.AOF, error) {
 	return aof, nil
 }
 
+func (s *Server) restoreData() error {
+	// Try RDB first if configured and exists
+	if s.config.RDBPath != "" {
+		if _, err := os.Stat(s.config.RDBPath); err == nil {
+			log.Printf("Loading snapshot from %s", s.config.RDBPath)
+			entries, err := persistence.LoadSnapshot(s.config.RDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to load snapshot: %v", err)
+			}
+			s.store.RestoreSnapshot(entries)
+			log.Println("Snapshot loaded.")
+		}
+	}
+
+	if s.config.AOFPath != "" {
+		aof, err := s.initAOF()
+		if err != nil {
+			return err
+		}
+		s.aof = aof
+		// Do not defer close here; Start manages lifecycle
+	}
+	return nil
+}
+
+func (s *Server) saveSnapshot() error {
+	if s.config.RDBPath == "" {
+		return fmt.Errorf("snapshot path not configured")
+	}
+	entries := s.store.SnapshotEntries()
+	if err := persistence.SaveSnapshot(s.config.RDBPath, entries); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) startBGSAVE() bool {
+	s.bgSave.mu.Lock()
+	if s.bgSave.running {
+		s.bgSave.mu.Unlock()
+		return false
+	}
+	s.bgSave.running = true
+	s.bgSave.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.bgSave.mu.Lock()
+			s.bgSave.running = false
+			s.bgSave.mu.Unlock()
+		}()
+		if err := s.saveSnapshot(); err != nil {
+			log.Printf("BGSAVE failed: %v", err)
+		} else {
+			log.Printf("BGSAVE completed: %s", s.config.RDBPath)
+		}
+	}()
+	return true
+}
+
+// Store exposes underlying store (for tests/embedding).
+func (s *Server) Store() *store.Store {
+	return s.store
+}
+
+// SaveSnapshot triggers a synchronous snapshot (used in tests).
+func (s *Server) SaveSnapshot() error {
+	return s.saveSnapshot()
+}
+
 // handleConnection manages a single client connection.
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	log.Printf("New connection from %s", conn.RemoteAddr())
+	if s.config.MaxClients > 0 {
+		defer func() {
+			s.muClients.Lock()
+			s.clients--
+			s.muClients.Unlock()
+		}()
+	}
 
 	reader := bufio.NewReader(conn)
 	writer := protocol.NewWriter(conn)
+	if s.config.AuthEnabled && s.config.Password == "" {
+		writer.WriteError(fmt.Errorf("ERR auth enabled but password not set"))
+		return
+	}
+
+	authenticated := !s.config.AuthEnabled
 
 	for {
 		cmd, err := protocol.ParseCommand(reader)
@@ -117,6 +254,37 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 		if cmd == nil {
+			continue
+		}
+
+		// Allowlist check
+		if len(s.config.AllowedCIDR) > 0 {
+			addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+			if ok {
+				ip, parseErr := netip.ParseAddr(addr.IP.String())
+				if parseErr != nil || !s.isAllowed(ip) {
+					writer.WriteError(fmt.Errorf("ERR connection not allowed"))
+					return
+				}
+			}
+		}
+
+		// Authentication gate
+		if !authenticated && strings.ToUpper(cmd.Name) != "AUTH" {
+			writer.WriteError(fmt.Errorf("NOAUTH Authentication required"))
+			continue
+		}
+		if strings.ToUpper(cmd.Name) == "AUTH" {
+			if len(cmd.Args) != 1 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'auth' command"))
+				continue
+			}
+			if cmd.Args[0] == s.config.Password {
+				authenticated = true
+				writer.WriteString("OK")
+			} else {
+				writer.WriteError(fmt.Errorf("ERR invalid password"))
+			}
 			continue
 		}
 
@@ -153,6 +321,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 		}
 	}
+}
+
+func (s *Server) isAllowed(ip netip.Addr) bool {
+	if len(s.config.AllowedCIDR) == 0 {
+		return true
+	}
+	for _, p := range s.config.AllowedCIDR {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleSubscribe handles the subscription loop for a client.
@@ -218,6 +398,30 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
+	case "PING":
+		return "PONG"
+	case "INFO":
+		stats := s.store.Stats()
+		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\n",
+			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory)
+		return info
+	case "SAVE":
+		if s.config.RDBPath == "" {
+			return "ERR snapshot path not configured"
+		}
+		if err := s.saveSnapshot(); err != nil {
+			return fmt.Sprintf("ERR %v", err)
+		}
+		return "OK"
+	case "BGSAVE":
+		if s.config.RDBPath == "" {
+			return "ERR snapshot path not configured"
+		}
+		started := s.startBGSAVE()
+		if !started {
+			return "ERR BGSAVE already in progress"
+		}
+		return "Background saving started"
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}

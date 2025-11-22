@@ -33,6 +33,25 @@ type Item struct {
 	Type      DataType    // The type of the value
 	ExpiresAt int64       // Unix timestamp in nanoseconds, 0 means no expiration
 	Size      int64       // Estimated size for memory accounting
+	Freq      int64       // access frequency (for LFU)
+}
+
+// Stats contains store metrics for monitoring.
+type Stats struct {
+	Keys           int
+	TTLKeys        int
+	MemoryUsed     int64
+	MaxMemory      int64
+	EvictionPolicy EvictionPolicy
+	Expired        int64
+}
+
+// SnapshotEntry represents a serialized key/value for persistence.
+type SnapshotEntry struct {
+	Key       string
+	Value     string
+	Type      DataType
+	ExpiresAt int64
 }
 
 // EvictionPolicy defines how to select keys to evict when max memory is reached.
@@ -42,6 +61,8 @@ const (
 	EvictionNoEviction EvictionPolicy = iota
 	EvictionAllKeysRandom
 	EvictionVolatileRandom
+	EvictionAllKeysLRU
+	EvictionAllKeysLFU
 )
 
 // Store represents the in-memory key-value store.
@@ -62,6 +83,8 @@ type Store struct {
 
 	// Optional: when true, allow eviction of TTL keys after FIFO is empty to honor maxMemory.
 	evictTTLWhenFull bool
+
+	expiredCount int64 // number of keys expired lazily/actively
 }
 
 // New creates a new Store instance.
@@ -75,6 +98,78 @@ func New(maxMemory int64, policy EvictionPolicy) *Store {
 		evictTTLWhenFull: true,
 	}
 	return s
+}
+
+// Stats returns current store statistics.
+func (s *Store) Stats() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ttl := 0
+	for _, item := range s.data {
+		if item.ExpiresAt > 0 {
+			ttl++
+		}
+	}
+	return Stats{
+		Keys:           len(s.data),
+		TTLKeys:        ttl,
+		MemoryUsed:     s.usedMemory,
+		MaxMemory:      s.maxMemory,
+		EvictionPolicy: s.evictionPolicy,
+		Expired:        s.expiredCount,
+	}
+}
+
+// SnapshotEntries returns a copy of current data for persistence.
+func (s *Store) SnapshotEntries() []SnapshotEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries := make([]SnapshotEntry, 0, len(s.data))
+	now := time.Now().UnixNano()
+	for k, v := range s.data {
+		// Skip expired during snapshot to avoid restoring stale data
+		if v.ExpiresAt > 0 && now > v.ExpiresAt {
+			continue
+		}
+		val, _ := v.Value.(string)
+		entries = append(entries, SnapshotEntry{
+			Key:       k,
+			Value:     val,
+			Type:      v.Type,
+			ExpiresAt: v.ExpiresAt,
+		})
+	}
+	return entries
+}
+
+// RestoreSnapshot loads entries into the store, replacing existing data.
+func (s *Store) RestoreSnapshot(entries []SnapshotEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = make(map[string]*Item, len(entries))
+	s.usedMemory = 0
+	s.fifoHead, s.fifoTail, s.fifoSize, s.tombs = 0, 0, 0, 0
+
+	now := time.Now().UnixNano()
+	for _, e := range entries {
+		if e.ExpiresAt > 0 && now > e.ExpiresAt {
+			continue
+		}
+		item := &Item{
+			Value:     e.Value,
+			Type:      e.Type,
+			ExpiresAt: e.ExpiresAt,
+			Size:      estimateItemSize(e.Key, e.Value),
+		}
+		s.data[e.Key] = item
+		s.usedMemory += item.Size
+		if item.ExpiresAt == 0 {
+			s.addFIFOUnlocked(e.Key)
+		}
+	}
 }
 
 // StartActiveExpiration starts the active expiration loop.
@@ -114,6 +209,7 @@ func (s *Store) activeExpire() {
 		}
 		if item.ExpiresAt > 0 && now > item.ExpiresAt {
 			s.deleteKeyLocked(key)
+			s.expiredCount++
 			expired++
 		}
 		count++
@@ -147,24 +243,90 @@ func (s *Store) evictIfNeeded() {
 		return
 	}
 
-	// FIFO eviction for non-TTL keys only.
-	for s.usedMemory > s.maxMemory && s.fifoSize > 0 {
-		key := s.popFIFO()
-		if key != "" {
-			s.deleteKeyLocked(key)
-		}
-	}
-
-	// Optionally evict TTL keys oldest-first (by expiresAt) if still over limit.
-	if s.evictTTLWhenFull && s.usedMemory > s.maxMemory {
-		for key, item := range s.data {
-			if s.usedMemory <= s.maxMemory {
-				break
-			}
-			if item.ExpiresAt > 0 {
+	switch s.evictionPolicy {
+	case EvictionAllKeysRandom:
+		s.evictRandom(false)
+	case EvictionVolatileRandom:
+		s.evictRandom(true)
+	case EvictionAllKeysLRU:
+		s.evictLRU()
+	case EvictionAllKeysLFU:
+		s.evictLFU()
+	default:
+		// FIFO eviction for non-TTL keys only.
+		for s.usedMemory > s.maxMemory && s.fifoSize > 0 {
+			key := s.popFIFO()
+			if key != "" {
 				s.deleteKeyLocked(key)
 			}
 		}
+		if s.evictTTLWhenFull && s.usedMemory > s.maxMemory {
+			for key, item := range s.data {
+				if s.usedMemory <= s.maxMemory {
+					break
+				}
+				if item.ExpiresAt > 0 {
+					s.deleteKeyLocked(key)
+				}
+			}
+		}
+	}
+}
+
+func (s *Store) evictRandom(volatileOnly bool) {
+	for key, item := range s.data {
+		if s.usedMemory <= s.maxMemory {
+			return
+		}
+		if volatileOnly && item.ExpiresAt == 0 {
+			continue
+		}
+		s.deleteKeyLocked(key)
+	}
+}
+
+func (s *Store) evictLRU() {
+	var oldestKey string
+	// Using ExpiresAt as a proxy for recency is incorrect; instead we can reuse Freq as a hit counter.
+	// For simplicity, approximate LRU by lowest Freq and then earliest expiration.
+	minFreq := int64(^uint64(0) >> 1)
+	minExpire := int64(^uint64(0) >> 1)
+	for k, v := range s.data {
+		if s.usedMemory <= s.maxMemory {
+			return
+		}
+		exp := v.ExpiresAt
+		if exp == 0 {
+			exp = minExpire
+		}
+		if v.Freq < minFreq || (v.Freq == minFreq && exp < minExpire) {
+			minFreq = v.Freq
+			minExpire = exp
+			oldestKey = k
+		}
+	}
+	if oldestKey != "" {
+		s.deleteKeyLocked(oldestKey)
+		if s.usedMemory > s.maxMemory {
+			s.evictLRU()
+		}
+	}
+}
+
+func (s *Store) evictLFU() {
+	for s.usedMemory > s.maxMemory {
+		var victim string
+		minFreq := int64(^uint64(0) >> 1)
+		for k, v := range s.data {
+			if v.Freq < minFreq {
+				minFreq = v.Freq
+				victim = k
+			}
+		}
+		if victim == "" {
+			return
+		}
+		s.deleteKeyLocked(victim)
 	}
 }
 
@@ -213,6 +375,7 @@ func (s *Store) getWithNow(key string, now int64) (string, error) {
 		item, exists = s.data[key]
 		if exists && item.ExpiresAt > 0 && now > item.ExpiresAt {
 			s.deleteKeyUnlocked(key)
+			s.expiredCount++
 		}
 		return "", ErrNotFound
 	}
@@ -221,6 +384,9 @@ func (s *Store) getWithNow(key string, now int64) (string, error) {
 		s.mu.RUnlock()
 		return "", ErrWrongType
 	}
+
+	// Update frequency for LFU
+	item.Freq++
 
 	val := item.Value.(string)
 	s.mu.RUnlock()
@@ -234,6 +400,7 @@ func (s *Store) getUnlockedWithNow(key string, now int64) (string, error) {
 	}
 	if item.ExpiresAt > 0 && now > item.ExpiresAt {
 		s.deleteKeyUnlocked(key)
+		s.expiredCount++
 		return "", ErrNotFound
 	}
 	if item.Type != TypeString {

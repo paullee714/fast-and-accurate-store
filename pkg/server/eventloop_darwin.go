@@ -25,21 +25,27 @@ type ClientState struct {
 	buffer       bytes.Buffer
 	writeBuffer  bytes.Buffer
 	writeEnabled bool
+	authed       bool
 }
 
 // StartEventLoop starts the kqueue-based event loop.
 func (s *Server) StartEventLoop() error {
+	if s.config.TLSCertPath != "" || s.config.TLSKeyPath != "" {
+		return fmt.Errorf("TLS is not supported in event loop mode; use standard mode instead")
+	}
+	if s.config.AuthEnabled && s.config.Password == "" {
+		return fmt.Errorf("auth enabled but no password provided")
+	}
+	if len(s.config.AllowedCIDR) > 0 {
+		return fmt.Errorf("CIDR allowlist is not supported in event loop mode; use standard mode")
+	}
+
 	// Parity with goroutine-per-connection path: start active expiration.
 	s.store.StartActiveExpiration()
 
-	// Initialize AOF and restore state if configured.
-	if s.config.AOFPath != "" {
-		aof, err := s.initAOF()
-		if err != nil {
-			return err
-		}
-		s.aof = aof
-		defer s.aof.Close()
+	// Restore RDB/AOF if configured.
+	if err := s.restoreData(); err != nil {
+		return err
 	}
 
 	// Create kqueue
@@ -158,7 +164,7 @@ func (el *EventLoop) accept(serverFd int) {
 			continue
 		}
 
-		el.connections[nfd] = &ClientState{fd: nfd}
+		el.connections[nfd] = &ClientState{fd: nfd, authed: el.server.config.Password == ""}
 		log.Printf("New connection (fd: %d)", nfd)
 	}
 }
@@ -208,6 +214,25 @@ func (el *EventLoop) read(fd int) {
 
 		// Advance buffer
 		client.buffer.Next(consumed)
+
+		// Authentication gate
+		if el.server.config.Password != "" && !client.authed {
+			if strings.ToUpper(cmd.Name) != "AUTH" {
+				el.queueWrite(client, []byte("-NOAUTH Authentication required\r\n"))
+				continue
+			}
+			if len(cmd.Args) != 1 {
+				el.queueWrite(client, []byte("-ERR wrong number of arguments for 'auth' command\r\n"))
+				continue
+			}
+			if cmd.Args[0] == el.server.config.Password {
+				client.authed = true
+				el.queueWrite(client, []byte("+OK\r\n"))
+			} else {
+				el.queueWrite(client, []byte("-ERR invalid password\r\n"))
+			}
+			continue
+		}
 
 		// Execute command and buffer response for async write.
 		response := el.server.executeCommand(cmd, false)

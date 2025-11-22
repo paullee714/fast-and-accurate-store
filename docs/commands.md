@@ -25,6 +25,37 @@ Retrieves the value stored at a key.
 
 ---
 
+### `PING`
+- **Syntax**: `PING`
+- **Response**: `PONG`
+
+### `INFO`
+- **Syntax**: `INFO`
+- **Response** (bulk string): newline-separated stats like:
+  ```
+  keys:<count>
+  keys_with_ttl:<count>
+  expired:<count>
+  memory_used:<bytes>
+  max_memory:<bytes>
+  ```
+
+### `AUTH`
+- **Syntax**: `AUTH password`
+- **Response**: `OK` on success; `NOAUTH`/`ERR` otherwise.
+
+### `SAVE`
+- **Syntax**: `SAVE`
+- **Response**: `OK` on success, error if snapshot path not configured.
+- **Note**: Blocks the client while snapshot is written.
+
+### `BGSAVE`
+- **Syntax**: `BGSAVE`
+- **Response**: `Background saving started` or error if one is already running.
+- **Note**: Requires `-rdb` snapshot path. Runs in background.
+
+---
+
 ## 📡 Messaging
 
 ### `SUBSCRIBE`
