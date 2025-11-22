@@ -49,6 +49,13 @@ go run cmd/fas/main.go
 go run cmd/fs/main.go PING
 ```
 
+Install binaries to PATH:
+```bash
+make install                     # installs fas and fs to /usr/local/bin
+fas -h                           # run server from PATH
+fs PING                          # client command from PATH
+```
+
 Common client flags:
 - `-host` (default 127.0.0.1)
 - `-port` (default 6379)
