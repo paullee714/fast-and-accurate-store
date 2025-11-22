@@ -35,6 +35,16 @@ type Item struct {
 	Size      int64       // Estimated size for memory accounting
 }
 
+// Stats contains store metrics for monitoring.
+type Stats struct {
+	Keys           int
+	TTLKeys        int
+	MemoryUsed     int64
+	MaxMemory      int64
+	EvictionPolicy EvictionPolicy
+	Expired        int64
+}
+
 // EvictionPolicy defines how to select keys to evict when max memory is reached.
 type EvictionPolicy int
 
@@ -62,6 +72,8 @@ type Store struct {
 
 	// Optional: when true, allow eviction of TTL keys after FIFO is empty to honor maxMemory.
 	evictTTLWhenFull bool
+
+	expiredCount int64 // number of keys expired lazily/actively
 }
 
 // New creates a new Store instance.
@@ -75,6 +87,27 @@ func New(maxMemory int64, policy EvictionPolicy) *Store {
 		evictTTLWhenFull: true,
 	}
 	return s
+}
+
+// Stats returns current store statistics.
+func (s *Store) Stats() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ttl := 0
+	for _, item := range s.data {
+		if item.ExpiresAt > 0 {
+			ttl++
+		}
+	}
+	return Stats{
+		Keys:           len(s.data),
+		TTLKeys:        ttl,
+		MemoryUsed:     s.usedMemory,
+		MaxMemory:      s.maxMemory,
+		EvictionPolicy: s.evictionPolicy,
+		Expired:        s.expiredCount,
+	}
 }
 
 // StartActiveExpiration starts the active expiration loop.
@@ -114,6 +147,7 @@ func (s *Store) activeExpire() {
 		}
 		if item.ExpiresAt > 0 && now > item.ExpiresAt {
 			s.deleteKeyLocked(key)
+			s.expiredCount++
 			expired++
 		}
 		count++
@@ -213,6 +247,7 @@ func (s *Store) getWithNow(key string, now int64) (string, error) {
 		item, exists = s.data[key]
 		if exists && item.ExpiresAt > 0 && now > item.ExpiresAt {
 			s.deleteKeyUnlocked(key)
+			s.expiredCount++
 		}
 		return "", ErrNotFound
 	}
@@ -234,6 +269,7 @@ func (s *Store) getUnlockedWithNow(key string, now int64) (string, error) {
 	}
 	if item.ExpiresAt > 0 && now > item.ExpiresAt {
 		s.deleteKeyUnlocked(key)
+		s.expiredCount++
 		return "", ErrNotFound
 	}
 	if item.Type != TypeString {

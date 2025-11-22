@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"net/netip"
 	"strings"
 
 	"fas/pkg/persistence"
@@ -16,6 +17,11 @@ func main() {
 	fsync := flag.String("fsync", "everysec", "Fsync policy: always, everysec, no")
 	useEventLoop := flag.Bool("eventloop", false, "Use single-threaded event loop (macOS only)")
 	maxMemory := flag.Int64("maxmemory", 1024*1024*1024, "Max memory in bytes (default 1GB)")
+	authEnabled := flag.Bool("auth", false, "Require AUTH for clients")
+	password := flag.String("requirepass", "", "Password for AUTH (required if -auth is true)")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate (PEM)")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key (PEM)")
+	allowCIDR := flag.String("allow-cidr", "", "Comma-separated CIDR list to allow (optional)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -40,6 +46,24 @@ func main() {
 		AOFPath:     *aofPath,
 		FsyncPolicy: policy,
 		MaxMemory:   *maxMemory,
+		AuthEnabled: *authEnabled,
+		Password:    *password,
+		TLSCertPath: *tlsCert,
+		TLSKeyPath:  *tlsKey,
+	}
+
+	if *allowCIDR != "" {
+		for _, part := range strings.Split(*allowCIDR, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			prefix, err := netip.ParsePrefix(part)
+			if err != nil {
+				log.Fatalf("Invalid CIDR %s: %v", part, err)
+			}
+			config.AllowedCIDR = append(config.AllowedCIDR, prefix)
+		}
 	}
 
 	// Initialize and start the server

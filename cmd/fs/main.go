@@ -52,6 +52,13 @@ func main() {
 
 func sendCommand(conn net.Conn, args []string) {
 	writer := protocol.NewWriter(conn)
+	// Optional: pre-auth if env FAS_PASSWORD is set
+	if pass := os.Getenv("FAS_PASSWORD"); pass != "" {
+		_ = writer.WriteCommand([]string{"AUTH", pass})
+		reader := bufio.NewReader(conn)
+		readAndPrintResponse(reader)
+	}
+
 	err := writer.WriteCommand(args)
 	if err != nil {
 		fmt.Printf("Error sending command: %v\n", err)

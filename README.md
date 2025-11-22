@@ -13,6 +13,7 @@
 - **Pub/Sub Messaging**: Real-time message publishing and subscription system.
 - **Simple Protocol**: Intuitive text-based command protocol.
 - **Persistence**: Append-only file (AOF) with configurable fsync policies.
+- **Operations**: Built-in `PING` and `INFO` (memory/keys/expired) for basic health/monitoring.
 
 ## 🛠 Getting Started
 
@@ -32,6 +33,10 @@ go run cmd/fas/main.go
 #   -fsync         always|everysec|no (default everysec)
 #   -eventloop     use single-threaded kqueue event loop (macOS only)
 #   -maxmemory     bytes; FIFO eviction for non-TTL keys, TTL keys evicted if still over limit
+#   -requirepass   optional password; clients must AUTH <password>
+#   -auth          enable AUTH requirement (must be true to enforce password)
+#   -tls-cert/-tls-key  enable TLS listener
+#   -allow-cidr    comma-separated CIDR allowlist (standard mode only)
 ```
 
 ### Usage (Client)
@@ -62,6 +67,13 @@ go run cmd/fs/main.go PUBLISH news breaking_news!
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 *2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
 ```
+
+### Monitoring/Health
+- `PING` → `PONG`
+- `INFO` (newline-separated fields): `keys:<n>`, `keys_with_ttl:<n>`, `expired:<n>`, `memory_used:<bytes>`, `max_memory:<bytes>`
+  ```bash
+  go run cmd/fs/main.go INFO
+  ```
 
 ## 🧪 Testing
 We use Go's built-in testing framework.

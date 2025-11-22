@@ -2,10 +2,12 @@ package server
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"strings"
 
 	"fas/pkg/persistence"
@@ -21,6 +23,11 @@ type Config struct {
 	AOFPath     string // Path to the AOF file
 	FsyncPolicy persistence.FsyncPolicy
 	MaxMemory   int64 // Max memory in bytes
+	AuthEnabled bool
+	Password    string // Optional password for AUTH
+	TLSCertPath string
+	TLSKeyPath  string
+	AllowedCIDR []netip.Prefix
 }
 
 // Server represents the TCP server instance.
@@ -30,6 +37,10 @@ type Server struct {
 	store  *store.Store
 	pubsub *pubsub.PubSub
 	aof    *persistence.AOF
+
+	stats struct {
+		expired int64
+	}
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -63,12 +74,27 @@ func (s *Server) Start() error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	var ln net.Listener
+	var err error
+	if s.config.TLSCertPath != "" && s.config.TLSKeyPath != "" {
+		cer, loadErr := tls.LoadX509KeyPair(s.config.TLSCertPath, s.config.TLSKeyPath)
+		if loadErr != nil {
+			return fmt.Errorf("failed to load TLS cert/key: %v", loadErr)
+		}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cer}}
+		ln, err = tls.Listen("tcp", addr, tlsCfg)
+		if err != nil {
+			return err
+		}
+		log.Printf("Listening with TLS on %s", addr)
+	} else {
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		log.Printf("Listening on %s", addr)
 	}
 	s.ln = ln
-	log.Printf("Listening on %s", addr)
 
 	for {
 		conn, err := ln.Accept()
@@ -106,6 +132,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	reader := bufio.NewReader(conn)
 	writer := protocol.NewWriter(conn)
+	if s.config.AuthEnabled && s.config.Password == "" {
+		writer.WriteError(fmt.Errorf("ERR auth enabled but password not set"))
+		return
+	}
+
+	authenticated := !s.config.AuthEnabled
 
 	for {
 		cmd, err := protocol.ParseCommand(reader)
@@ -117,6 +149,37 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 		if cmd == nil {
+			continue
+		}
+
+		// Allowlist check
+		if len(s.config.AllowedCIDR) > 0 {
+			addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+			if ok {
+				ip, parseErr := netip.ParseAddr(addr.IP.String())
+				if parseErr != nil || !s.isAllowed(ip) {
+					writer.WriteError(fmt.Errorf("ERR connection not allowed"))
+					return
+				}
+			}
+		}
+
+		// Authentication gate
+		if !authenticated && strings.ToUpper(cmd.Name) != "AUTH" {
+			writer.WriteError(fmt.Errorf("NOAUTH Authentication required"))
+			continue
+		}
+		if strings.ToUpper(cmd.Name) == "AUTH" {
+			if len(cmd.Args) != 1 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'auth' command"))
+				continue
+			}
+			if cmd.Args[0] == s.config.Password {
+				authenticated = true
+				writer.WriteString("OK")
+			} else {
+				writer.WriteError(fmt.Errorf("ERR invalid password"))
+			}
 			continue
 		}
 
@@ -153,6 +216,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 		}
 	}
+}
+
+func (s *Server) isAllowed(ip netip.Addr) bool {
+	if len(s.config.AllowedCIDR) == 0 {
+		return true
+	}
+	for _, p := range s.config.AllowedCIDR {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleSubscribe handles the subscription loop for a client.
@@ -218,6 +293,13 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
+	case "PING":
+		return "PONG"
+	case "INFO":
+		stats := s.store.Stats()
+		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\n",
+			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory)
+		return info
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}
