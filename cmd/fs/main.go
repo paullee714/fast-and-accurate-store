@@ -2,31 +2,41 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"flag"
 	"fmt"
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"fas/pkg/protocol"
 )
 
-const (
-	DefaultHost = "localhost"
-	DefaultPort = "6379"
-)
-
 func main() {
-	addr := net.JoinHostPort(DefaultHost, DefaultPort)
-	conn, err := net.Dial("tcp", addr)
+	host := flag.String("host", "127.0.0.1", "Server host")
+	port := flag.String("port", "6379", "Server port")
+	useTLS := flag.Bool("tls", false, "Enable TLS (insecure, skips verify)")
+	flag.Parse()
+
+	addr := net.JoinHostPort(*host, *port)
+	var conn net.Conn
+	var err error
+	if *useTLS {
+		conn, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+	}
 	if err != nil {
 		fmt.Printf("Error connecting to server: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
+	args := flag.Args()
 	// If arguments are provided, execute single command
-	if len(os.Args) > 1 {
-		sendCommand(conn, os.Args[1:])
+	if len(args) > 0 {
+		sendCommand(conn, args)
 		return
 	}
 

@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
+	"sync"
 
 	"fas/pkg/persistence"
 	"fas/pkg/protocol"
@@ -28,6 +30,7 @@ type Config struct {
 	TLSCertPath string
 	TLSKeyPath  string
 	AllowedCIDR []netip.Prefix
+	RDBPath     string // Optional snapshot path; if present, load before AOF
 }
 
 // Server represents the TCP server instance.
@@ -40,6 +43,11 @@ type Server struct {
 
 	stats struct {
 		expired int64
+	}
+
+	bgSave struct {
+		mu      sync.Mutex
+		running bool
 	}
 }
 
@@ -62,16 +70,6 @@ func NewServer(config Config) *Server {
 func (s *Server) Start() error {
 	// Start active expiration for store (only in multi-threaded mode)
 	s.store.StartActiveExpiration()
-
-	// Initialize AOF
-	if s.config.AOFPath != "" {
-		aof, err := s.initAOF()
-		if err != nil {
-			return err
-		}
-		s.aof = aof
-		defer s.aof.Close()
-	}
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	var ln net.Listener
@@ -123,6 +121,76 @@ func (s *Server) initAOF() (*persistence.AOF, error) {
 	log.Println("State restored.")
 
 	return aof, nil
+}
+
+func (s *Server) restoreData() error {
+	// Try RDB first if configured and exists
+	if s.config.RDBPath != "" {
+		if _, err := os.Stat(s.config.RDBPath); err == nil {
+			log.Printf("Loading snapshot from %s", s.config.RDBPath)
+			entries, err := persistence.LoadSnapshot(s.config.RDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to load snapshot: %v", err)
+			}
+			s.store.RestoreSnapshot(entries)
+			log.Println("Snapshot loaded.")
+		}
+	}
+
+	if s.config.AOFPath != "" {
+		aof, err := s.initAOF()
+		if err != nil {
+			return err
+		}
+		s.aof = aof
+		// Do not defer close here; Start manages lifecycle
+	}
+	return nil
+}
+
+func (s *Server) saveSnapshot() error {
+	if s.config.RDBPath == "" {
+		return fmt.Errorf("snapshot path not configured")
+	}
+	entries := s.store.SnapshotEntries()
+	if err := persistence.SaveSnapshot(s.config.RDBPath, entries); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) startBGSAVE() bool {
+	s.bgSave.mu.Lock()
+	if s.bgSave.running {
+		s.bgSave.mu.Unlock()
+		return false
+	}
+	s.bgSave.running = true
+	s.bgSave.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.bgSave.mu.Lock()
+			s.bgSave.running = false
+			s.bgSave.mu.Unlock()
+		}()
+		if err := s.saveSnapshot(); err != nil {
+			log.Printf("BGSAVE failed: %v", err)
+		} else {
+			log.Printf("BGSAVE completed: %s", s.config.RDBPath)
+		}
+	}()
+	return true
+}
+
+// Store exposes underlying store (for tests/embedding).
+func (s *Server) Store() *store.Store {
+	return s.store
+}
+
+// SaveSnapshot triggers a synchronous snapshot (used in tests).
+func (s *Server) SaveSnapshot() error {
+	return s.saveSnapshot()
 }
 
 // handleConnection manages a single client connection.
@@ -300,6 +368,23 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\n",
 			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory)
 		return info
+	case "SAVE":
+		if s.config.RDBPath == "" {
+			return "ERR snapshot path not configured"
+		}
+		if err := s.saveSnapshot(); err != nil {
+			return fmt.Sprintf("ERR %v", err)
+		}
+		return "OK"
+	case "BGSAVE":
+		if s.config.RDBPath == "" {
+			return "ERR snapshot path not configured"
+		}
+		started := s.startBGSAVE()
+		if !started {
+			return "ERR BGSAVE already in progress"
+		}
+		return "Background saving started"
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}

@@ -22,6 +22,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate (PEM)")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key (PEM)")
 	allowCIDR := flag.String("allow-cidr", "", "Comma-separated CIDR list to allow (optional)")
+	rdbPath := flag.String("rdb", "", "Path to snapshot (RDB) file (optional)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -50,6 +51,7 @@ func main() {
 		Password:    *password,
 		TLSCertPath: *tlsCert,
 		TLSKeyPath:  *tlsKey,
+		RDBPath:     *rdbPath,
 	}
 
 	if *allowCIDR != "" {

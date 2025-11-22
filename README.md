@@ -37,10 +37,56 @@ go run cmd/fas/main.go
 #   -auth          enable AUTH requirement (must be true to enforce password)
 #   -tls-cert/-tls-key  enable TLS listener
 #   -allow-cidr    comma-separated CIDR allowlist (standard mode only)
+#   -rdb           path to snapshot file for SAVE/BGSAVE (loaded before AOF if present)
 ```
 
 ### Usage (Client)
-You can use the dedicated CLI tool `fs` (RESP) to communicate with the server.
+`fas` = server, `fs` = client.
+
+Quick start (no auth):
+```bash
+go run cmd/fas/main.go
+go run cmd/fs/main.go PING
+```
+
+Common client flags:
+- `-host` (default 127.0.0.1)
+- `-port` (default 6379)
+- `-tls` (connect with TLS, skips verification)
+- `FAS_PASSWORD` env: auto `AUTH <password>` before first command
+
+### Examples
+**Run server**
+```bash
+# No auth, no TLS
+go run cmd/fas/main.go
+
+# With auth + snapshot + AOF + TLS
+go run cmd/fas/main.go \
+  -auth -requirepass secret123 \
+  -rdb /var/lib/fas/fas.rdb \
+  -aof /var/lib/fas/fas.aof \
+  -fsync everysec \
+  -tls-cert /path/to/cert.pem \
+  -tls-key /path/to/key.pem
+```
+
+**Client single command**
+```bash
+go run cmd/fs/main.go -host 127.0.0.1 -port 6379 PING
+
+# With password (auto AUTH)
+FAS_PASSWORD=secret123 go run cmd/fs/main.go GET mykey
+
+# With TLS
+go run cmd/fs/main.go -tls PING
+```
+
+**Client interactive (REPL)**
+```bash
+go run cmd/fs/main.go                # enter commands: PING, SET k v, GET k
+FAS_PASSWORD=secret123 go run cmd/fs/main.go -tls   # auth + TLS, then type commands
+```
 
 **1. Data Operations**
 ```bash
@@ -49,6 +95,21 @@ go run cmd/fs/main.go SET mykey hello_world
 
 # Get data (GET key)
 go run cmd/fs/main.go GET mykey
+
+# PING (health)
+go run cmd/fs/main.go PING
+
+# INFO (stats)
+go run cmd/fs/main.go INFO
+
+# Authenticate (if server started with -auth -requirepass)
+FAS_PASSWORD=secret go run cmd/fs/main.go GET mykey   # auto AUTH via env
+go run cmd/fs/main.go AUTH secret
+go run cmd/fs/main.go GET mykey
+
+# Snapshot (requires -rdb)
+go run cmd/fs/main.go SAVE
+go run cmd/fs/main.go BGSAVE
 ```
 
 **2. Pub/Sub (Messaging)**
@@ -66,6 +127,7 @@ go run cmd/fs/main.go PUBLISH news breaking_news!
 ```
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 *2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
+*1\r\n$4\r\nPING\r\n
 ```
 
 ### Monitoring/Health

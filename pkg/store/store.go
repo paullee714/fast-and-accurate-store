@@ -45,6 +45,14 @@ type Stats struct {
 	Expired        int64
 }
 
+// SnapshotEntry represents a serialized key/value for persistence.
+type SnapshotEntry struct {
+	Key       string
+	Value     string
+	Type      DataType
+	ExpiresAt int64
+}
+
 // EvictionPolicy defines how to select keys to evict when max memory is reached.
 type EvictionPolicy int
 
@@ -107,6 +115,57 @@ func (s *Store) Stats() Stats {
 		MaxMemory:      s.maxMemory,
 		EvictionPolicy: s.evictionPolicy,
 		Expired:        s.expiredCount,
+	}
+}
+
+// SnapshotEntries returns a copy of current data for persistence.
+func (s *Store) SnapshotEntries() []SnapshotEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries := make([]SnapshotEntry, 0, len(s.data))
+	now := time.Now().UnixNano()
+	for k, v := range s.data {
+		// Skip expired during snapshot to avoid restoring stale data
+		if v.ExpiresAt > 0 && now > v.ExpiresAt {
+			continue
+		}
+		val, _ := v.Value.(string)
+		entries = append(entries, SnapshotEntry{
+			Key:       k,
+			Value:     val,
+			Type:      v.Type,
+			ExpiresAt: v.ExpiresAt,
+		})
+	}
+	return entries
+}
+
+// RestoreSnapshot loads entries into the store, replacing existing data.
+func (s *Store) RestoreSnapshot(entries []SnapshotEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = make(map[string]*Item, len(entries))
+	s.usedMemory = 0
+	s.fifoHead, s.fifoTail, s.fifoSize, s.tombs = 0, 0, 0, 0
+
+	now := time.Now().UnixNano()
+	for _, e := range entries {
+		if e.ExpiresAt > 0 && now > e.ExpiresAt {
+			continue
+		}
+		item := &Item{
+			Value:     e.Value,
+			Type:      e.Type,
+			ExpiresAt: e.ExpiresAt,
+			Size:      estimateItemSize(e.Key, e.Value),
+		}
+		s.data[e.Key] = item
+		s.usedMemory += item.Size
+		if item.ExpiresAt == 0 {
+			s.addFIFOUnlocked(e.Key)
+		}
 	}
 }
 

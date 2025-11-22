@@ -43,14 +43,9 @@ func (s *Server) StartEventLoop() error {
 	// Parity with goroutine-per-connection path: start active expiration.
 	s.store.StartActiveExpiration()
 
-	// Initialize AOF and restore state if configured.
-	if s.config.AOFPath != "" {
-		aof, err := s.initAOF()
-		if err != nil {
-			return err
-		}
-		s.aof = aof
-		defer s.aof.Close()
+	// Restore RDB/AOF if configured.
+	if err := s.restoreData(); err != nil {
+		return err
 	}
 
 	// Create kqueue
