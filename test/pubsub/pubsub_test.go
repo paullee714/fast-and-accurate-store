@@ -132,7 +132,7 @@ func TestPubSub_SlowSubscriber(t *testing.T) {
 	channel := "slow_channel"
 
 	t.Log("Step 1: Subscribing")
-	ch := ps.Subscribe(channel)
+	_ = ps.Subscribe(channel)
 
 	// Fill buffer (buffer size is 100)
 	t.Log("Step 2: Filling buffer")
