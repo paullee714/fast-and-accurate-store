@@ -47,6 +47,7 @@ func (s *Server) StartEventLoop() error {
 	if err := s.restoreData(); err != nil {
 		return err
 	}
+	s.startMetrics()
 
 	// Create kqueue
 	kq, err := syscall.Kqueue()

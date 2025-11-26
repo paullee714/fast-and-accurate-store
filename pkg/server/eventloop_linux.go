@@ -45,6 +45,7 @@ func (s *Server) StartEventLoop() error {
 	if err := s.restoreData(); err != nil {
 		return err
 	}
+	s.startMetrics()
 
 	epfd, err := syscall.EpollCreate1(0)
 	if err != nil {
