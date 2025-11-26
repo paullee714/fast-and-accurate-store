@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"strings"
@@ -33,6 +34,7 @@ type Config struct {
 	AllowedCIDR []netip.Prefix
 	RDBPath     string // Optional snapshot path; if present, load before AOF
 	MaxClients  int    // 0 = unlimited
+	MetricsPort int    // optional http metrics port
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -89,6 +91,11 @@ func NewServer(config Config) *Server {
 func (s *Server) Start() error {
 	// Start active expiration for store (only in multi-threaded mode)
 	s.store.StartActiveExpiration()
+
+	if err := s.restoreData(); err != nil {
+		return err
+	}
+	s.startMetrics()
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	var ln net.Listener
@@ -333,6 +340,36 @@ func (s *Server) isAllowed(ip netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) currentClients() int {
+	s.muClients.Lock()
+	defer s.muClients.Unlock()
+	return s.clients
+}
+
+func (s *Server) startMetrics() {
+	if s.config.MetricsPort == 0 {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		stats := s.store.Stats()
+		clients := s.currentClients()
+		fmt.Fprintf(w, "fas_keys %d\n", stats.Keys)
+		fmt.Fprintf(w, "fas_keys_with_ttl %d\n", stats.TTLKeys)
+		fmt.Fprintf(w, "fas_expired_total %d\n", stats.Expired)
+		fmt.Fprintf(w, "fas_memory_used_bytes %d\n", stats.MemoryUsed)
+		fmt.Fprintf(w, "fas_max_memory_bytes %d\n", stats.MaxMemory)
+		fmt.Fprintf(w, "fas_clients %d\n", clients)
+	})
+	addr := fmt.Sprintf(":%d", s.config.MetricsPort)
+	go func() {
+		srv := &http.Server{Addr: addr, Handler: mux}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics server error: %v", err)
+		}
+	}()
 }
 
 // handleSubscribe handles the subscription loop for a client.
