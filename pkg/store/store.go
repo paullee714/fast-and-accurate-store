@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/heap"
 	"errors"
 	"sync"
 	"time"
@@ -29,11 +30,13 @@ var (
 
 // Item represents a single data item stored in the store.
 type Item struct {
-	Value     interface{} // The actual value stored
-	Type      DataType    // The type of the value
-	ExpiresAt int64       // Unix timestamp in nanoseconds, 0 means no expiration
-	Size      int64       // Estimated size for memory accounting
-	Freq      int64       // access frequency (for LFU)
+	Value      interface{} // The actual value stored
+	Type       DataType    // The type of the value
+	ExpiresAt  int64       // Unix timestamp in nanoseconds, 0 means no expiration
+	Size       int64       // Estimated size for memory accounting
+	Freq       int64       // access frequency (for LFU)
+	LastAccess int64       // last access timestamp (ns)
+	AccessID   int64       // monotonically increasing version for heap freshness
 }
 
 // Stats contains store metrics for monitoring.
@@ -85,6 +88,10 @@ type Store struct {
 	evictTTLWhenFull bool
 
 	expiredCount int64 // number of keys expired lazily/actively
+
+	accessCounter int64
+	lruHeap       *lruMinHeap
+	lfuHeap       *lfuMinHeap
 }
 
 // New creates a new Store instance.
@@ -96,6 +103,8 @@ func New(maxMemory int64, policy EvictionPolicy) *Store {
 		fifoCap:          1024,
 		fifoKeys:         make([]string, 1024),
 		evictTTLWhenFull: true,
+		lruHeap:          &lruMinHeap{},
+		lfuHeap:          &lfuMinHeap{},
 	}
 	return s
 }
@@ -158,17 +167,22 @@ func (s *Store) RestoreSnapshot(entries []SnapshotEntry) {
 		if e.ExpiresAt > 0 && now > e.ExpiresAt {
 			continue
 		}
+		accessID := s.nextAccessID()
 		item := &Item{
-			Value:     e.Value,
-			Type:      e.Type,
-			ExpiresAt: e.ExpiresAt,
-			Size:      estimateItemSize(e.Key, e.Value),
+			Value:      e.Value,
+			Type:       e.Type,
+			ExpiresAt:  e.ExpiresAt,
+			Size:       estimateItemSize(e.Key, e.Value),
+			Freq:       1,
+			LastAccess: now,
+			AccessID:   accessID,
 		}
 		s.data[e.Key] = item
 		s.usedMemory += item.Size
 		if item.ExpiresAt == 0 {
 			s.addFIFOUnlocked(e.Key)
 		}
+		s.pushHeaps(e.Key, item)
 	}
 }
 
@@ -286,47 +300,22 @@ func (s *Store) evictRandom(volatileOnly bool) {
 }
 
 func (s *Store) evictLRU() {
-	var oldestKey string
-	// Using ExpiresAt as a proxy for recency is incorrect; instead we can reuse Freq as a hit counter.
-	// For simplicity, approximate LRU by lowest Freq and then earliest expiration.
-	minFreq := int64(^uint64(0) >> 1)
-	minExpire := int64(^uint64(0) >> 1)
-	for k, v := range s.data {
-		if s.usedMemory <= s.maxMemory {
+	for s.usedMemory > s.maxMemory {
+		key := s.popLRU()
+		if key == "" {
 			return
 		}
-		exp := v.ExpiresAt
-		if exp == 0 {
-			exp = minExpire
-		}
-		if v.Freq < minFreq || (v.Freq == minFreq && exp < minExpire) {
-			minFreq = v.Freq
-			minExpire = exp
-			oldestKey = k
-		}
-	}
-	if oldestKey != "" {
-		s.deleteKeyLocked(oldestKey)
-		if s.usedMemory > s.maxMemory {
-			s.evictLRU()
-		}
+		s.deleteKeyLocked(key)
 	}
 }
 
 func (s *Store) evictLFU() {
 	for s.usedMemory > s.maxMemory {
-		var victim string
-		minFreq := int64(^uint64(0) >> 1)
-		for k, v := range s.data {
-			if v.Freq < minFreq {
-				minFreq = v.Freq
-				victim = k
-			}
-		}
-		if victim == "" {
+		key := s.popLFU()
+		if key == "" {
 			return
 		}
-		s.deleteKeyLocked(victim)
+		s.deleteKeyLocked(key)
 	}
 }
 
@@ -363,34 +352,34 @@ func (s *Store) UnsafeGet(key string) (string, error) {
 func (s *Store) getWithNow(key string, now int64) (string, error) {
 	s.mu.RLock()
 	item, exists := s.data[key]
+	s.mu.RUnlock()
 	if !exists {
-		s.mu.RUnlock()
 		return "", ErrNotFound
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, exists = s.data[key]
+	if !exists {
+		return "", ErrNotFound
+	}
 	if item.ExpiresAt > 0 && now > item.ExpiresAt {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		item, exists = s.data[key]
-		if exists && item.ExpiresAt > 0 && now > item.ExpiresAt {
-			s.deleteKeyUnlocked(key)
-			s.expiredCount++
-		}
+		s.deleteKeyUnlocked(key)
+		s.expiredCount++
 		return "", ErrNotFound
 	}
-
 	if item.Type != TypeString {
-		s.mu.RUnlock()
 		return "", ErrWrongType
 	}
 
-	// Update frequency for LFU
+	// Update access stats
+	item.LastAccess = now
+	item.AccessID = s.nextAccessID()
 	item.Freq++
+	s.pushHeaps(key, item)
 
-	val := item.Value.(string)
-	s.mu.RUnlock()
-	return val, nil
+	return item.Value.(string), nil
 }
 
 func (s *Store) getUnlockedWithNow(key string, now int64) (string, error) {
@@ -406,21 +395,33 @@ func (s *Store) getUnlockedWithNow(key string, now int64) (string, error) {
 	if item.Type != TypeString {
 		return "", ErrWrongType
 	}
+
+	item.LastAccess = now
+	item.AccessID = s.nextAccessID()
+	item.Freq++
+	s.pushHeaps(key, item)
+
 	return item.Value.(string), nil
 }
 
 // setUnlocked sets a key without taking a lock. Caller must manage locking or exclusivity.
 func (s *Store) setUnlocked(key string, value string, ttl time.Duration) {
+	now := time.Now().UnixNano()
 	expiresAt := int64(0)
 	if ttl > 0 {
 		expiresAt = time.Now().Add(ttl).UnixNano()
 	}
 
+	accessID := s.nextAccessID()
+
 	newItem := &Item{
-		Value:     value,
-		Type:      TypeString,
-		ExpiresAt: expiresAt,
-		Size:      estimateItemSize(key, value),
+		Value:      value,
+		Type:       TypeString,
+		ExpiresAt:  expiresAt,
+		Size:       estimateItemSize(key, value),
+		Freq:       1,
+		LastAccess: now,
+		AccessID:   accessID,
 	}
 
 	// Remove existing entry accounting
@@ -439,6 +440,7 @@ func (s *Store) setUnlocked(key string, value string, ttl time.Duration) {
 	} else {
 		s.removeFIFOUnlocked(key)
 	}
+	s.pushHeaps(key, newItem)
 
 	s.evictIfNeeded()
 }
@@ -550,4 +552,84 @@ func (s *Store) compactIfNeeded() {
 	s.fifoTail = idx
 	s.fifoSize = idx
 	s.tombs = 0
+}
+
+func (s *Store) nextAccessID() int64 {
+	s.accessCounter++
+	return s.accessCounter
+}
+
+func (s *Store) pushHeaps(key string, item *Item) {
+	heap.Push(s.lruHeap, lruEntry{key: key, ts: item.LastAccess, version: item.AccessID})
+	heap.Push(s.lfuHeap, lfuEntry{key: key, freq: item.Freq, ts: item.LastAccess, version: item.AccessID})
+}
+
+func (s *Store) popLRU() string {
+	for s.lruHeap.Len() > 0 {
+		entry := heap.Pop(s.lruHeap).(lruEntry)
+		if item, ok := s.data[entry.key]; ok && item.AccessID == entry.version {
+			return entry.key
+		}
+	}
+	return ""
+}
+
+func (s *Store) popLFU() string {
+	for s.lfuHeap.Len() > 0 {
+		entry := heap.Pop(s.lfuHeap).(lfuEntry)
+		if item, ok := s.data[entry.key]; ok && item.AccessID == entry.version {
+			return entry.key
+		}
+	}
+	return ""
+}
+
+type lruEntry struct {
+	key     string
+	ts      int64
+	version int64
+}
+
+type lruMinHeap []lruEntry
+
+func (h lruMinHeap) Len() int           { return len(h) }
+func (h lruMinHeap) Less(i, j int) bool { return h[i].ts < h[j].ts }
+func (h lruMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *lruMinHeap) Push(x interface{}) {
+	*h = append(*h, x.(lruEntry))
+}
+func (h *lruMinHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+type lfuEntry struct {
+	key     string
+	freq    int64
+	ts      int64
+	version int64
+}
+
+type lfuMinHeap []lfuEntry
+
+func (h lfuMinHeap) Len() int { return len(h) }
+func (h lfuMinHeap) Less(i, j int) bool {
+	if h[i].freq == h[j].freq {
+		return h[i].ts < h[j].ts
+	}
+	return h[i].freq < h[j].freq
+}
+func (h lfuMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *lfuMinHeap) Push(x interface{}) {
+	*h = append(*h, x.(lfuEntry))
+}
+func (h *lfuMinHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
