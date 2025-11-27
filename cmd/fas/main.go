@@ -27,6 +27,7 @@ func main() {
 	maxClients := flag.Int("maxclients", 0, "Maximum concurrent clients (0 = unlimited)")
 	configFile := flag.String("config", "", "Path to config file (key=value)")
 	metricsPort := flag.Int("metrics-port", 0, "Expose Prometheus-style metrics on this port (0=disabled)")
+	seed := flag.String("seed", "", "Optional seed master address (host:port) to auto-join as replica")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -64,6 +65,7 @@ func main() {
 		RDBPath:     *rdbPath,
 		MaxClients:  *maxClients,
 		MetricsPort: *metricsPort,
+		ReplicaOf:   *seed,
 	}
 
 	if *allowCIDR != "" {

@@ -527,6 +527,13 @@ func (s *Server) startReplicaClient() {
 // executeCommand executes a single command and returns the response string.
 // replay: if true, indicates we are replaying from AOF (so don't write to AOF again)
 func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
+	writeCmd := false
+	defer func() {
+		if writeCmd && !replay {
+			s.broadcastToReplicas(cmd)
+		}
+	}()
+
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) != 2 {
@@ -535,6 +542,7 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		if s.replicaMode && !replay {
 			return "ERR READONLY replica"
 		}
+		writeCmd = true
 		s.store.Set(cmd.Args[0], cmd.Args[1], 0)
 
 		// Persist to AOF if not replaying
@@ -562,6 +570,7 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		if s.replicaMode && !replay {
 			return "ERR READONLY replica"
 		}
+		writeCmd = true
 		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
 	case "PING":
