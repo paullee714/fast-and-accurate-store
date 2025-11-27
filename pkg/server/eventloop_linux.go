@@ -46,6 +46,9 @@ func (s *Server) StartEventLoop() error {
 		return err
 	}
 	s.startMetrics()
+	if s.replicaMode {
+		go s.startReplicaClient()
+	}
 
 	epfd, err := syscall.EpollCreate1(0)
 	if err != nil {
