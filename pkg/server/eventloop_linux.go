@@ -33,6 +33,9 @@ func (s *Server) StartEventLoop() error {
 	if s.config.TLSCertPath != "" || s.config.TLSKeyPath != "" {
 		return fmt.Errorf("TLS is not supported in event loop mode; use standard mode instead")
 	}
+	if s.config.ReplicaUseTLS {
+		return fmt.Errorf("Replica TLS is not supported in event loop mode")
+	}
 	if len(s.config.AllowedCIDR) > 0 {
 		return fmt.Errorf("CIDR allowlist is not supported in event loop mode; use standard mode")
 	}

@@ -22,21 +22,23 @@ import (
 
 // Config holds the configuration for the server.
 type Config struct {
-	Host        string
-	Port        int
-	AOFPath     string // Path to the AOF file
-	FsyncPolicy persistence.FsyncPolicy
-	MaxMemory   int64 // Max memory in bytes
-	Eviction    store.EvictionPolicy
-	AuthEnabled bool
-	Password    string // Optional password for AUTH
-	TLSCertPath string
-	TLSKeyPath  string
-	AllowedCIDR []netip.Prefix
-	RDBPath     string // Optional snapshot path; if present, load before AOF
-	MaxClients  int    // 0 = unlimited
-	MetricsPort int    // optional http metrics port
-	ReplicaOf   string // optional master address host:port (replica mode)
+	Host          string
+	Port          int
+	AOFPath       string // Path to the AOF file
+	FsyncPolicy   persistence.FsyncPolicy
+	MaxMemory     int64 // Max memory in bytes
+	Eviction      store.EvictionPolicy
+	AuthEnabled   bool
+	Password      string // Optional password for AUTH
+	TLSCertPath   string
+	TLSKeyPath    string
+	AllowedCIDR   []netip.Prefix
+	RDBPath       string // Optional snapshot path; if present, load before AOF
+	MaxClients    int    // 0 = unlimited
+	MetricsPort   int    // optional http metrics port
+	ReplicaOf     string // optional master address host:port (replica mode)
+	ReplicaUseTLS bool
+	ReplicaPass   string
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -52,6 +54,9 @@ func (c *Config) ValidateAndFill() error {
 	}
 	if (c.TLSCertPath == "") != (c.TLSKeyPath == "") {
 		return fmt.Errorf("both tls-cert and tls-key must be provided together")
+	}
+	if c.ReplicaOf != "" && c.ReplicaUseTLS && c.TLSCertPath == "" && c.TLSKeyPath == "" {
+		// replica TLS client is allowed even if server isn't serving TLS; no strict check
 	}
 	return nil
 }
@@ -83,6 +88,9 @@ type Server struct {
 	// replica mode client
 	replicaMode bool
 	masterAddr  string
+
+	leaderMu   sync.RWMutex
+	leaderAddr string
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -96,6 +104,7 @@ func NewServer(config Config) *Server {
 		replicas:    make(map[int]*replicaClient),
 		replicaMode: config.ReplicaOf != "",
 		masterAddr:  config.ReplicaOf,
+		leaderAddr:  fmt.Sprintf("%s:%d", config.Host, config.Port),
 	}
 }
 
@@ -113,6 +122,7 @@ func (s *Server) Start() error {
 	if s.replicaMode {
 		go s.startReplicaClient()
 	}
+	go s.startLeaderHeartbeat()
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	var ln net.Listener
@@ -490,7 +500,13 @@ func (s *Server) broadcastToReplicas(cmd *protocol.Command) {
 // startReplicaClient runs in replica mode: connects to master and applies incoming commands.
 func (s *Server) startReplicaClient() {
 	for {
-		conn, err := net.Dial("tcp", s.masterAddr)
+		var conn net.Conn
+		var err error
+		if s.config.ReplicaUseTLS {
+			conn, err = tls.Dial("tcp", s.masterAddr, &tls.Config{InsecureSkipVerify: true})
+		} else {
+			conn, err = net.Dial("tcp", s.masterAddr)
+		}
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -498,6 +514,21 @@ func (s *Server) startReplicaClient() {
 
 		reader := bufio.NewReader(conn)
 		writer := protocol.NewWriter(conn)
+
+		// AUTH if needed
+		if s.config.ReplicaPass != "" {
+			if err := writer.WriteCommand([]string{"AUTH", s.config.ReplicaPass}); err != nil {
+				conn.Close()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			// consume reply
+			if _, err := reader.ReadString('\n'); err != nil {
+				conn.Close()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+		}
 
 		// Request replication stream
 		if err := writer.WriteCommand([]string{"REPL"}); err != nil {
@@ -605,4 +636,25 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		s.broadcastToReplicas(cmd)
 	}
 	return ""
+}
+
+// Simple leader heartbeat; in this phase we only announce self and detect missing leader to self-elect.
+func (s *Server) startLeaderHeartbeat() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		// If we are replica and masterAddr unreachable, self-elect to allow writes (single slot model)
+		if s.replicaMode {
+			conn, err := net.DialTimeout("tcp", s.masterAddr, 500*time.Millisecond)
+			if err != nil {
+				log.Printf("leader unreachable, self-electing")
+				s.leaderMu.Lock()
+				s.leaderAddr = fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+				s.leaderMu.Unlock()
+				s.replicaMode = false
+			} else {
+				conn.Close()
+			}
+		}
+	}
 }

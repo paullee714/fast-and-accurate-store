@@ -28,6 +28,8 @@ func main() {
 	configFile := flag.String("config", "", "Path to config file (key=value)")
 	metricsPort := flag.Int("metrics-port", 0, "Expose Prometheus-style metrics on this port (0=disabled)")
 	seed := flag.String("seed", "", "Optional seed master address (host:port) to auto-join as replica")
+	seedTLS := flag.Bool("seed-tls", false, "Use TLS to connect to seed (insecure)")
+	seedPass := flag.String("seed-pass", "", "Password for seed AUTH (if seed requires auth)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -52,20 +54,22 @@ func main() {
 
 	// Configure the server
 	config := server.Config{
-		Host:        *host,
-		Port:        *port,
-		AOFPath:     *aofPath,
-		FsyncPolicy: policy,
-		MaxMemory:   *maxMemory,
-		Eviction:    evictPolicy,
-		AuthEnabled: *authEnabled,
-		Password:    *password,
-		TLSCertPath: *tlsCert,
-		TLSKeyPath:  *tlsKey,
-		RDBPath:     *rdbPath,
-		MaxClients:  *maxClients,
-		MetricsPort: *metricsPort,
-		ReplicaOf:   *seed,
+		Host:          *host,
+		Port:          *port,
+		AOFPath:       *aofPath,
+		FsyncPolicy:   policy,
+		MaxMemory:     *maxMemory,
+		Eviction:      evictPolicy,
+		AuthEnabled:   *authEnabled,
+		Password:      *password,
+		TLSCertPath:   *tlsCert,
+		TLSKeyPath:    *tlsKey,
+		RDBPath:       *rdbPath,
+		MaxClients:    *maxClients,
+		MetricsPort:   *metricsPort,
+		ReplicaOf:     *seed,
+		ReplicaUseTLS: *seedTLS,
+		ReplicaPass:   *seedPass,
 	}
 
 	if *allowCIDR != "" {
