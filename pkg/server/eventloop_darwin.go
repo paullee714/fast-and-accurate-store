@@ -48,6 +48,9 @@ func (s *Server) StartEventLoop() error {
 		return err
 	}
 	s.startMetrics()
+	if s.replicaMode {
+		go s.startReplicaClient()
+	}
 
 	// Create kqueue
 	kq, err := syscall.Kqueue()

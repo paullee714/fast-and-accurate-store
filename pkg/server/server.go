@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"fas/pkg/persistence"
 	"fas/pkg/protocol"
@@ -35,6 +36,7 @@ type Config struct {
 	RDBPath     string // Optional snapshot path; if present, load before AOF
 	MaxClients  int    // 0 = unlimited
 	MetricsPort int    // optional http metrics port
+	ReplicaOf   string // optional master address host:port (replica mode)
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -73,6 +75,14 @@ type Server struct {
 
 	muClients sync.Mutex
 	clients   int
+
+	repMu      sync.Mutex
+	replicas   map[int]*replicaClient
+	replicaSeq int
+
+	// replica mode client
+	replicaMode bool
+	masterAddr  string
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -80,9 +90,12 @@ func NewServer(config Config) *Server {
 	_ = config.ValidateAndFill()
 
 	return &Server{
-		config: config,
-		store:  store.New(config.MaxMemory, config.Eviction),
-		pubsub: pubsub.New(),
+		config:      config,
+		store:       store.New(config.MaxMemory, config.Eviction),
+		pubsub:      pubsub.New(),
+		replicas:    make(map[int]*replicaClient),
+		replicaMode: config.ReplicaOf != "",
+		masterAddr:  config.ReplicaOf,
 	}
 }
 
@@ -96,6 +109,10 @@ func (s *Server) Start() error {
 		return err
 	}
 	s.startMetrics()
+
+	if s.replicaMode {
+		go s.startReplicaClient()
+	}
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	var ln net.Listener
@@ -295,6 +312,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
+		if strings.ToUpper(cmd.Name) == "REPL" {
+			s.handleReplicaConnection(conn, writer)
+			return
+		}
+
 		// Handle SUBSCRIBE command specially as it changes connection state
 		if strings.ToUpper(cmd.Name) == "SUBSCRIBE" {
 			if len(cmd.Args) < 1 {
@@ -401,6 +423,107 @@ func (s *Server) handleSubscribe(conn net.Conn, writer *protocol.Writer, channel
 	}
 }
 
+type replicaClient struct {
+	ch chan *protocol.Command
+}
+
+// handleReplicaConnection sends a full snapshot then streams future write commands.
+func (s *Server) handleReplicaConnection(conn net.Conn, w *protocol.Writer) {
+	log.Printf("Replica connected from %s", conn.RemoteAddr())
+
+	// Send snapshot as SET commands
+	for _, e := range s.store.SnapshotEntries() {
+		cmd := []string{"SET", e.Key, e.Value}
+		if err := w.WriteCommand(cmd); err != nil {
+			log.Printf("Replica snapshot write error: %v", err)
+			return
+		}
+	}
+
+	// Register for streaming
+	rc := &replicaClient{ch: make(chan *protocol.Command, 1024)}
+	s.repMu.Lock()
+	s.replicaSeq++
+	id := s.replicaSeq
+	s.replicas[id] = rc
+	s.repMu.Unlock()
+
+	// Ensure write events flush
+	go func() {
+		for cmd := range rc.ch {
+			if err := w.WriteCommand(append([]string{cmd.Name}, cmd.Args...)); err != nil {
+				log.Printf("Replica stream error: %v", err)
+				break
+			}
+		}
+		conn.Close()
+	}()
+
+	// Block until connection closes
+	buf := make([]byte, 1)
+	conn.Read(buf)
+
+	s.repMu.Lock()
+	delete(s.replicas, id)
+	close(rc.ch)
+	s.repMu.Unlock()
+}
+
+func (s *Server) broadcastToReplicas(cmd *protocol.Command) {
+	if cmd == nil {
+		return
+	}
+	if cmd.Name != "SET" && cmd.Name != "PUBLISH" {
+		return
+	}
+	s.repMu.Lock()
+	defer s.repMu.Unlock()
+	for _, r := range s.replicas {
+		select {
+		case r.ch <- cmd:
+		default:
+			// drop if replica is slow
+		}
+	}
+}
+
+// startReplicaClient runs in replica mode: connects to master and applies incoming commands.
+func (s *Server) startReplicaClient() {
+	for {
+		conn, err := net.Dial("tcp", s.masterAddr)
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		reader := bufio.NewReader(conn)
+		writer := protocol.NewWriter(conn)
+
+		// Request replication stream
+		if err := writer.WriteCommand([]string{"REPL"}); err != nil {
+			conn.Close()
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		for {
+			cmd, err := protocol.ParseCommand(reader)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("replica parse error: %v", err)
+				}
+				conn.Close()
+				break
+			}
+			if cmd == nil {
+				continue
+			}
+			s.executeCommand(cmd, true)
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 // executeCommand executes a single command and returns the response string.
 // replay: if true, indicates we are replaying from AOF (so don't write to AOF again)
 func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
@@ -408,6 +531,9 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	case "SET":
 		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'set' command"
+		}
+		if s.replicaMode && !replay {
+			return "ERR READONLY replica"
 		}
 		s.store.Set(cmd.Args[0], cmd.Args[1], 0)
 
@@ -432,6 +558,9 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	case "PUBLISH":
 		if len(cmd.Args) != 2 {
 			return "ERR wrong number of arguments for 'publish' command"
+		}
+		if s.replicaMode && !replay {
+			return "ERR READONLY replica"
 		}
 		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
@@ -462,4 +591,9 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}
+
+	if !replay {
+		s.broadcastToReplicas(cmd)
+	}
+	return ""
 }
