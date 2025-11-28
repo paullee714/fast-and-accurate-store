@@ -39,6 +39,7 @@ type Config struct {
 	ReplicaOf     string // optional master address host:port (replica mode)
 	ReplicaUseTLS bool
 	ReplicaPass   string
+	Slots         int // total slots (for future cluster; default 16384)
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -48,6 +49,9 @@ func (c *Config) ValidateAndFill() error {
 	}
 	if c.Eviction == 0 {
 		c.Eviction = store.EvictionAllKeysRandom
+	}
+	if c.Slots == 0 {
+		c.Slots = 16384
 	}
 	if c.AuthEnabled && c.Password == "" {
 		return fmt.Errorf("auth enabled but no password provided")
@@ -91,6 +95,10 @@ type Server struct {
 
 	leaderMu   sync.RWMutex
 	leaderAddr string
+
+	selfAddr string
+
+	slotCount int
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -105,6 +113,8 @@ func NewServer(config Config) *Server {
 		replicaMode: config.ReplicaOf != "",
 		masterAddr:  config.ReplicaOf,
 		leaderAddr:  fmt.Sprintf("%s:%d", config.Host, config.Port),
+		selfAddr:    fmt.Sprintf("%s:%d", config.Host, config.Port),
+		slotCount:   config.Slots,
 	}
 }
 
@@ -380,6 +390,16 @@ func (s *Server) currentClients() int {
 	return s.clients
 }
 
+func (s *Server) currentLeader() string {
+	s.leaderMu.RLock()
+	defer s.leaderMu.RUnlock()
+	return s.leaderAddr
+}
+
+func (s *Server) isLeader() bool {
+	return s.currentLeader() == s.selfAddr
+}
+
 func (s *Server) startMetrics() {
 	if s.config.MetricsPort == 0 {
 		return
@@ -388,12 +408,15 @@ func (s *Server) startMetrics() {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		stats := s.store.Stats()
 		clients := s.currentClients()
+		leader := s.currentLeader()
 		fmt.Fprintf(w, "fas_keys %d\n", stats.Keys)
 		fmt.Fprintf(w, "fas_keys_with_ttl %d\n", stats.TTLKeys)
 		fmt.Fprintf(w, "fas_expired_total %d\n", stats.Expired)
 		fmt.Fprintf(w, "fas_memory_used_bytes %d\n", stats.MemoryUsed)
 		fmt.Fprintf(w, "fas_max_memory_bytes %d\n", stats.MaxMemory)
 		fmt.Fprintf(w, "fas_clients %d\n", clients)
+		fmt.Fprintf(w, "fas_leader_info 1\n")
+		fmt.Fprintf(w, "fas_leader_address %q\n", leader)
 	})
 	addr := fmt.Sprintf(":%d", s.config.MetricsPort)
 	go func() {
@@ -537,6 +560,11 @@ func (s *Server) startReplicaClient() {
 			continue
 		}
 
+		// Update leader
+		s.leaderMu.Lock()
+		s.leaderAddr = s.masterAddr
+		s.leaderMu.Unlock()
+
 		for {
 			cmd, err := protocol.ParseCommand(reader)
 			if err != nil {
@@ -564,6 +592,16 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 			s.broadcastToReplicas(cmd)
 		}
 	}()
+
+	// Slot redirection if not leader (simple single-slot mapping)
+	if !s.isLeader() && !replay {
+		leader := s.currentLeader()
+		slot := 0
+		if len(cmd.Args) > 0 {
+			slot = keySlot(cmd.Args[0], s.slotCount)
+		}
+		return fmt.Sprintf("MOVED %d %s", slot, leader)
+	}
 
 	switch cmd.Name {
 	case "SET":
@@ -608,9 +646,23 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		return "PONG"
 	case "INFO":
 		stats := s.store.Stats()
-		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\n",
-			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory)
+		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\nleader:%s\n",
+			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory, s.currentLeader())
 		return info
+	case "CLUSTER":
+		if len(cmd.Args) == 0 {
+			return "ERR wrong number of arguments for 'cluster' command"
+		}
+		switch strings.ToUpper(cmd.Args[0]) {
+		case "INFO":
+			return s.clusterInfo()
+		case "NODES":
+			return s.clusterNodes()
+		case "SLOTS":
+			return s.clusterSlots()
+		default:
+			return fmt.Sprintf("ERR unknown subcommand '%s'", cmd.Args[0])
+		}
 	case "SAVE":
 		if s.config.RDBPath == "" {
 			return "ERR snapshot path not configured"
@@ -657,4 +709,21 @@ func (s *Server) startLeaderHeartbeat() {
 			}
 		}
 	}
+}
+
+// Cluster introspection (single leader, single slot range for now)
+func (s *Server) clusterInfo() string {
+	state := "ok"
+	return fmt.Sprintf("cluster_state:%s\ncluster_slots_assigned:%d\ncluster_slots_ok:%d\nleader:%s\n",
+		state, s.slotCount, s.slotCount, s.currentLeader())
+}
+
+func (s *Server) clusterNodes() string {
+	leader := s.currentLeader()
+	return fmt.Sprintf("%s master - 0 0 connected\n", leader)
+}
+
+func (s *Server) clusterSlots() string {
+	leader := s.currentLeader()
+	return fmt.Sprintf("%d-%d %s\n", 0, s.slotCount-1, leader)
 }
