@@ -461,6 +461,13 @@ func (s *Store) deleteKeyUnlocked(key string) {
 	}
 }
 
+// Delete removes a key if it exists.
+func (s *Store) Delete(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteKeyUnlocked(key)
+}
+
 func (s *Store) addFIFOUnlocked(key string) {
 	s.ensureFIFOCap()
 	s.fifoKeys[s.fifoTail] = key

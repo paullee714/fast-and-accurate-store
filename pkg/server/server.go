@@ -611,6 +611,15 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 	}
 
+	// Enforce slot ownership: if this node is not owner for the key slot, redirect
+	if len(cmd.Args) > 0 {
+		slot := keySlot(cmd.Args[0], s.slotCount)
+		target := s.cluster.Lookup(slot)
+		if target != "" && target != s.selfAddr {
+			return fmt.Sprintf("MOVED %d %s", slot, target)
+		}
+	}
+
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) != 2 {
@@ -688,6 +697,16 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 			return "ERR BGSAVE already in progress"
 		}
 		return "Background saving started"
+	case "MIGRATE":
+		if len(cmd.Args) < 2 {
+			return "ERR wrong number of arguments for 'migrate' command"
+		}
+		key := cmd.Args[0]
+		target := cmd.Args[1]
+		if err := s.migrateKey(key, target); err != nil {
+			return fmt.Sprintf("ERR %v", err)
+		}
+		return "OK"
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}

@@ -105,6 +105,61 @@ func TestIntegration_PubSub(t *testing.T) {
 	}
 }
 
+func TestIntegration_Migrate(t *testing.T) {
+	root := repoRoot(t)
+	bin := filepath.Join(root, "bin", "fas")
+
+	// Always build fresh for integration
+	{
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/fas")
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build fas: %v (%s)", err, out)
+		}
+	}
+
+	port1 := pickPort(t)
+	port2 := pickPort(t)
+
+	s1 := exec.Command(bin, "-host", "127.0.0.1", "-port", fmt.Sprint(port1), "-aof", "")
+	s1.Dir = root
+	if err := s1.Start(); err != nil {
+		t.Fatalf("start server1: %v", err)
+	}
+	defer s1.Process.Kill()
+
+	s2 := exec.Command(bin, "-host", "127.0.0.1", "-port", fmt.Sprint(port2), "-aof", "")
+	s2.Dir = root
+	if err := s2.Start(); err != nil {
+		t.Fatalf("start server2: %v", err)
+	}
+	defer s2.Process.Kill()
+
+	// Set key on server1
+	conn1 := dialWithRetry(t, "127.0.0.1", port1)
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	w1 := protocol.NewWriter(conn1)
+
+	mustWrite(t, w1, []string{"SET", "mk", "mv"})
+	expectLine(t, r1, "+OK\r\n")
+
+	// Migrate key to server2
+	target := fmt.Sprintf("127.0.0.1:%d", port2)
+	mustWrite(t, w1, []string{"MIGRATE", "mk", target})
+	expectLine(t, r1, "+OK\r\n")
+
+	// Verify on server2
+	conn2 := dialWithRetry(t, "127.0.0.1", port2)
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	w2 := protocol.NewWriter(conn2)
+	mustWrite(t, w2, []string{"GET", "mk"})
+	if got := readBulk(t, r2); got != "mv" {
+		t.Fatalf("migrated value mismatch: %q", got)
+	}
+}
+
 // Helpers
 func mustWrite(t *testing.T, w *protocol.Writer, args []string) {
 	t.Helper()
