@@ -27,6 +27,10 @@ func main() {
 	maxClients := flag.Int("maxclients", 0, "Maximum concurrent clients (0 = unlimited)")
 	configFile := flag.String("config", "", "Path to config file (key=value)")
 	metricsPort := flag.Int("metrics-port", 0, "Expose Prometheus-style metrics on this port (0=disabled)")
+	seed := flag.String("seed", "", "Seed master address (host:port) to auto-join as replica")
+	seedTLS := flag.Bool("seed-tls", false, "Use TLS to connect to seed (insecure)")
+	seedPass := flag.String("seed-pass", "", "Password for seed AUTH (if seed requires auth)")
+	slotRanges := flag.String("cluster-slot-ranges", "", "Static slot ranges mapping (e.g., 0-5000:1.1.1.1:6379,5001-16383:2.2.2.2:6379)")
 	flag.Parse()
 
 	log.Println("FAS: Fast and Accurate System v0.1.0")
@@ -51,19 +55,22 @@ func main() {
 
 	// Configure the server
 	config := server.Config{
-		Host:        *host,
-		Port:        *port,
-		AOFPath:     *aofPath,
-		FsyncPolicy: policy,
-		MaxMemory:   *maxMemory,
-		Eviction:    evictPolicy,
-		AuthEnabled: *authEnabled,
-		Password:    *password,
-		TLSCertPath: *tlsCert,
-		TLSKeyPath:  *tlsKey,
-		RDBPath:     *rdbPath,
-		MaxClients:  *maxClients,
-		MetricsPort: *metricsPort,
+		Host:          *host,
+		Port:          *port,
+		AOFPath:       *aofPath,
+		FsyncPolicy:   policy,
+		MaxMemory:     *maxMemory,
+		Eviction:      evictPolicy,
+		AuthEnabled:   *authEnabled,
+		Password:      *password,
+		TLSCertPath:   *tlsCert,
+		TLSKeyPath:    *tlsKey,
+		RDBPath:       *rdbPath,
+		MaxClients:    *maxClients,
+		MetricsPort:   *metricsPort,
+		ReplicaOf:     *seed,
+		ReplicaUseTLS: *seedTLS,
+		ReplicaPass:   *seedPass,
 	}
 
 	if *allowCIDR != "" {
@@ -85,6 +92,15 @@ func main() {
 		if err := server.LoadConfigFile(*configFile, &config); err != nil {
 			log.Fatalf("Failed to load config file: %v", err)
 		}
+	}
+
+	// Slot ranges override if provided
+	if *slotRanges != "" {
+		ranges, err := server.ParseSlotRanges(*slotRanges)
+		if err != nil {
+			log.Fatalf("Invalid cluster-slot-ranges: %v", err)
+		}
+		config.StaticSlots = ranges
 	}
 
 	// Initialize and start the server

@@ -86,6 +86,13 @@ func LoadConfigFile(path string, cfg *Config) error {
 			} else {
 				return fmt.Errorf("invalid metrics-port: %s", val)
 			}
+		case "seed":
+			cfg.ReplicaOf = val
+			cfg.AuthEnabled = true
+		case "seed-tls":
+			cfg.ReplicaUseTLS = strings.ToLower(val) == "true"
+		case "seed-pass":
+			cfg.ReplicaPass = val
 		default:
 			// ignore unknown keys
 		}

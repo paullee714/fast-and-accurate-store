@@ -22,21 +22,25 @@ import (
 
 // Config holds the configuration for the server.
 type Config struct {
-	Host        string
-	Port        int
-	AOFPath     string // Path to the AOF file
-	FsyncPolicy persistence.FsyncPolicy
-	MaxMemory   int64 // Max memory in bytes
-	Eviction    store.EvictionPolicy
-	AuthEnabled bool
-	Password    string // Optional password for AUTH
-	TLSCertPath string
-	TLSKeyPath  string
-	AllowedCIDR []netip.Prefix
-	RDBPath     string // Optional snapshot path; if present, load before AOF
-	MaxClients  int    // 0 = unlimited
-	MetricsPort int    // optional http metrics port
-	ReplicaOf   string // optional master address host:port (replica mode)
+	Host          string
+	Port          int
+	AOFPath       string // Path to the AOF file
+	FsyncPolicy   persistence.FsyncPolicy
+	MaxMemory     int64 // Max memory in bytes
+	Eviction      store.EvictionPolicy
+	AuthEnabled   bool
+	Password      string // Optional password for AUTH
+	TLSCertPath   string
+	TLSKeyPath    string
+	AllowedCIDR   []netip.Prefix
+	RDBPath       string // Optional snapshot path; if present, load before AOF
+	MaxClients    int    // 0 = unlimited
+	MetricsPort   int    // optional http metrics port
+	ReplicaOf     string // optional master address host:port (replica mode)
+	ReplicaUseTLS bool
+	ReplicaPass   string
+	Slots         int // total slots (for future cluster; default 16384)
+	StaticSlots   []SlotRange
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -47,11 +51,17 @@ func (c *Config) ValidateAndFill() error {
 	if c.Eviction == 0 {
 		c.Eviction = store.EvictionAllKeysRandom
 	}
+	if c.Slots == 0 {
+		c.Slots = 16384
+	}
 	if c.AuthEnabled && c.Password == "" {
 		return fmt.Errorf("auth enabled but no password provided")
 	}
 	if (c.TLSCertPath == "") != (c.TLSKeyPath == "") {
 		return fmt.Errorf("both tls-cert and tls-key must be provided together")
+	}
+	if c.ReplicaOf != "" && c.ReplicaUseTLS && c.TLSCertPath == "" && c.TLSKeyPath == "" {
+		// replica TLS client is allowed even if server isn't serving TLS; no strict check
 	}
 	return nil
 }
@@ -83,6 +93,14 @@ type Server struct {
 	// replica mode client
 	replicaMode bool
 	masterAddr  string
+
+	leaderMu   sync.RWMutex
+	leaderAddr string
+
+	selfAddr string
+
+	slotCount int
+	cluster   *ClusterState
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -96,6 +114,10 @@ func NewServer(config Config) *Server {
 		replicas:    make(map[int]*replicaClient),
 		replicaMode: config.ReplicaOf != "",
 		masterAddr:  config.ReplicaOf,
+		leaderAddr:  fmt.Sprintf("%s:%d", config.Host, config.Port),
+		selfAddr:    fmt.Sprintf("%s:%d", config.Host, config.Port),
+		slotCount:   config.Slots,
+		cluster:     NewClusterState(config.Slots, fmt.Sprintf("%s:%d", config.Host, config.Port)),
 	}
 }
 
@@ -109,10 +131,14 @@ func (s *Server) Start() error {
 		return err
 	}
 	s.startMetrics()
+	if len(s.config.StaticSlots) > 0 {
+		s.cluster.SetRanges(s.config.StaticSlots)
+	}
 
 	if s.replicaMode {
 		go s.startReplicaClient()
 	}
+	go s.startLeaderHeartbeat()
 
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	var ln net.Listener
@@ -370,6 +396,16 @@ func (s *Server) currentClients() int {
 	return s.clients
 }
 
+func (s *Server) currentLeader() string {
+	s.leaderMu.RLock()
+	defer s.leaderMu.RUnlock()
+	return s.leaderAddr
+}
+
+func (s *Server) isLeader() bool {
+	return s.currentLeader() == s.selfAddr
+}
+
 func (s *Server) startMetrics() {
 	if s.config.MetricsPort == 0 {
 		return
@@ -378,12 +414,15 @@ func (s *Server) startMetrics() {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		stats := s.store.Stats()
 		clients := s.currentClients()
+		leader := s.currentLeader()
 		fmt.Fprintf(w, "fas_keys %d\n", stats.Keys)
 		fmt.Fprintf(w, "fas_keys_with_ttl %d\n", stats.TTLKeys)
 		fmt.Fprintf(w, "fas_expired_total %d\n", stats.Expired)
 		fmt.Fprintf(w, "fas_memory_used_bytes %d\n", stats.MemoryUsed)
 		fmt.Fprintf(w, "fas_max_memory_bytes %d\n", stats.MaxMemory)
 		fmt.Fprintf(w, "fas_clients %d\n", clients)
+		fmt.Fprintf(w, "fas_leader_info 1\n")
+		fmt.Fprintf(w, "fas_leader_address %q\n", leader)
 	})
 	addr := fmt.Sprintf(":%d", s.config.MetricsPort)
 	go func() {
@@ -490,7 +529,13 @@ func (s *Server) broadcastToReplicas(cmd *protocol.Command) {
 // startReplicaClient runs in replica mode: connects to master and applies incoming commands.
 func (s *Server) startReplicaClient() {
 	for {
-		conn, err := net.Dial("tcp", s.masterAddr)
+		var conn net.Conn
+		var err error
+		if s.config.ReplicaUseTLS {
+			conn, err = tls.Dial("tcp", s.masterAddr, &tls.Config{InsecureSkipVerify: true})
+		} else {
+			conn, err = net.Dial("tcp", s.masterAddr)
+		}
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -499,12 +544,32 @@ func (s *Server) startReplicaClient() {
 		reader := bufio.NewReader(conn)
 		writer := protocol.NewWriter(conn)
 
+		// AUTH if needed
+		if s.config.ReplicaPass != "" {
+			if err := writer.WriteCommand([]string{"AUTH", s.config.ReplicaPass}); err != nil {
+				conn.Close()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			// consume reply
+			if _, err := reader.ReadString('\n'); err != nil {
+				conn.Close()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+		}
+
 		// Request replication stream
 		if err := writer.WriteCommand([]string{"REPL"}); err != nil {
 			conn.Close()
 			time.Sleep(1 * time.Second)
 			continue
 		}
+
+		// Update leader
+		s.leaderMu.Lock()
+		s.leaderAddr = s.masterAddr
+		s.leaderMu.Unlock()
 
 		for {
 			cmd, err := protocol.ParseCommand(reader)
@@ -527,6 +592,34 @@ func (s *Server) startReplicaClient() {
 // executeCommand executes a single command and returns the response string.
 // replay: if true, indicates we are replaying from AOF (so don't write to AOF again)
 func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
+	writeCmd := false
+	defer func() {
+		if writeCmd && !replay {
+			s.broadcastToReplicas(cmd)
+		}
+	}()
+
+	// Slot redirection if not leader for the key slot
+	if !s.isLeader() && !replay {
+		slot := 0
+		if len(cmd.Args) > 0 {
+			slot = keySlot(cmd.Args[0], s.slotCount)
+		}
+		target := s.cluster.Lookup(slot)
+		if target != "" && target != s.selfAddr {
+			return fmt.Sprintf("MOVED %d %s", slot, target)
+		}
+	}
+
+	// Enforce slot ownership: if this node is not owner for the key slot, redirect
+	if len(cmd.Args) > 0 {
+		slot := keySlot(cmd.Args[0], s.slotCount)
+		target := s.cluster.Lookup(slot)
+		if target != "" && target != s.selfAddr {
+			return fmt.Sprintf("MOVED %d %s", slot, target)
+		}
+	}
+
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) != 2 {
@@ -535,6 +628,7 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		if s.replicaMode && !replay {
 			return "ERR READONLY replica"
 		}
+		writeCmd = true
 		s.store.Set(cmd.Args[0], cmd.Args[1], 0)
 
 		// Persist to AOF if not replaying
@@ -562,15 +656,30 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		if s.replicaMode && !replay {
 			return "ERR READONLY replica"
 		}
+		writeCmd = true
 		count := s.pubsub.Publish(cmd.Args[0], cmd.Args[1])
 		return fmt.Sprintf("(integer) %d", count)
 	case "PING":
 		return "PONG"
 	case "INFO":
 		stats := s.store.Stats()
-		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\n",
-			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory)
+		info := fmt.Sprintf("keys:%d\nkeys_with_ttl:%d\nexpired:%d\nmemory_used:%d\nmax_memory:%d\nleader:%s\n",
+			stats.Keys, stats.TTLKeys, stats.Expired, stats.MemoryUsed, stats.MaxMemory, s.currentLeader())
 		return info
+	case "CLUSTER":
+		if len(cmd.Args) == 0 {
+			return "ERR wrong number of arguments for 'cluster' command"
+		}
+		switch strings.ToUpper(cmd.Args[0]) {
+		case "INFO":
+			return s.clusterInfo()
+		case "NODES":
+			return s.clusterNodes()
+		case "SLOTS":
+			return s.clusterSlots()
+		default:
+			return fmt.Sprintf("ERR unknown subcommand '%s'", cmd.Args[0])
+		}
 	case "SAVE":
 		if s.config.RDBPath == "" {
 			return "ERR snapshot path not configured"
@@ -588,6 +697,16 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 			return "ERR BGSAVE already in progress"
 		}
 		return "Background saving started"
+	case "MIGRATE":
+		if len(cmd.Args) < 2 {
+			return "ERR wrong number of arguments for 'migrate' command"
+		}
+		key := cmd.Args[0]
+		target := cmd.Args[1]
+		if err := s.migrateKey(key, target); err != nil {
+			return fmt.Sprintf("ERR %v", err)
+		}
+		return "OK"
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", cmd.Name)
 	}
@@ -596,4 +715,41 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		s.broadcastToReplicas(cmd)
 	}
 	return ""
+}
+
+// Simple leader heartbeat; in this phase we only announce self and detect missing leader to self-elect.
+func (s *Server) startLeaderHeartbeat() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		// If we are replica and masterAddr unreachable, self-elect to allow writes (single slot model)
+		if s.replicaMode {
+			conn, err := net.DialTimeout("tcp", s.masterAddr, 500*time.Millisecond)
+			if err != nil {
+				log.Printf("leader unreachable, self-electing")
+				s.leaderMu.Lock()
+				s.leaderAddr = fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+				s.leaderMu.Unlock()
+				s.replicaMode = false
+			} else {
+				conn.Close()
+			}
+		}
+	}
+}
+
+// Cluster introspection (single leader, single slot range for now)
+func (s *Server) clusterInfo() string {
+	state := "ok"
+	return fmt.Sprintf("cluster_state:%s\ncluster_slots_assigned:%d\ncluster_slots_ok:%d\nleader:%s\n",
+		state, s.slotCount, s.slotCount, s.currentLeader())
+}
+
+func (s *Server) clusterNodes() string {
+	leader := s.currentLeader()
+	return fmt.Sprintf("%s master - 0 0 connected\n", leader)
+}
+
+func (s *Server) clusterSlots() string {
+	return s.cluster.SlotsInfo()
 }
