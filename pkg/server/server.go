@@ -40,6 +40,7 @@ type Config struct {
 	ReplicaUseTLS bool
 	ReplicaPass   string
 	Slots         int // total slots (for future cluster; default 16384)
+	StaticSlots   []SlotRange
 }
 
 // ValidateAndFill sets defaults and validates combinations.
@@ -99,6 +100,7 @@ type Server struct {
 	selfAddr string
 
 	slotCount int
+	cluster   *ClusterState
 }
 
 // NewServer creates a new Server instance with the given configuration.
@@ -115,6 +117,7 @@ func NewServer(config Config) *Server {
 		leaderAddr:  fmt.Sprintf("%s:%d", config.Host, config.Port),
 		selfAddr:    fmt.Sprintf("%s:%d", config.Host, config.Port),
 		slotCount:   config.Slots,
+		cluster:     NewClusterState(config.Slots, fmt.Sprintf("%s:%d", config.Host, config.Port)),
 	}
 }
 
@@ -128,6 +131,9 @@ func (s *Server) Start() error {
 		return err
 	}
 	s.startMetrics()
+	if len(s.config.StaticSlots) > 0 {
+		s.cluster.SetRanges(s.config.StaticSlots)
+	}
 
 	if s.replicaMode {
 		go s.startReplicaClient()
@@ -593,14 +599,16 @@ func (s *Server) executeCommand(cmd *protocol.Command, replay bool) string {
 		}
 	}()
 
-	// Slot redirection if not leader (simple single-slot mapping)
+	// Slot redirection if not leader for the key slot
 	if !s.isLeader() && !replay {
-		leader := s.currentLeader()
 		slot := 0
 		if len(cmd.Args) > 0 {
 			slot = keySlot(cmd.Args[0], s.slotCount)
 		}
-		return fmt.Sprintf("MOVED %d %s", slot, leader)
+		target := s.cluster.Lookup(slot)
+		if target != "" && target != s.selfAddr {
+			return fmt.Sprintf("MOVED %d %s", slot, target)
+		}
 	}
 
 	switch cmd.Name {
@@ -724,6 +732,5 @@ func (s *Server) clusterNodes() string {
 }
 
 func (s *Server) clusterSlots() string {
-	leader := s.currentLeader()
-	return fmt.Sprintf("%d-%d %s\n", 0, s.slotCount-1, leader)
+	return s.cluster.SlotsInfo()
 }

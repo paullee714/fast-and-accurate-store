@@ -88,6 +88,7 @@ func LoadConfigFile(path string, cfg *Config) error {
 			}
 		case "seed":
 			cfg.ReplicaOf = val
+			cfg.AuthEnabled = true
 		case "seed-tls":
 			cfg.ReplicaUseTLS = strings.ToLower(val) == "true"
 		case "seed-pass":
